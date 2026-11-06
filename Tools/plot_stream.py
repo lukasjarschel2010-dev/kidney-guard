@@ -11,7 +11,8 @@ press); the peak's time is only accurate to one streamed sample period, though.
 
 Shows the last few seconds of X/Y/Z and the vector magnitude, with the
 impact threshold drawn in, and the FSRs on D8, D9 and D10 when the sketch
-sends them (kidney_guard does). Optionally records every sample to CSV. Close
+sends them (kidney_guard does), drawn as conductance, which is roughly
+proportional to force. Optionally records every sample to CSV. Close
 the Arduino Serial Monitor first, only one program can open the port.
 
 Usage:
@@ -19,6 +20,13 @@ Usage:
     python3 Tools/plot_stream.py -o impact.csv    # also record to CSV
     python3 Tools/plot_stream.py -p /dev/cu.usbmodem1101 -w 5 -t 50
     python3 Tools/plot_stream.py -r 100           # stream 100 samples/sec
+
+X/Y/Z and magnitude are drawn flat at rest: samples within --noise-band of an
+axis's resting value draw as that value, and anything further out draws at
+its true raw value, so impact heights are kept. X/Y/Z are then shifted so each
+axis rests at 0, cancelling gravity and the sensor's zero-g offset, and the
+magnitude is taken from those shifted values, so it rests at 0 too. Use
+--noise-band 0 for the raw signal. The CSV is always raw.
 
 Keys: space = pause/resume the view (recording continues).
 
@@ -42,9 +50,18 @@ SYNC0 = 0xA5
 #  0x5B  x, y, z                       (older layout, no FSRs)
 #  0x5C  x, y, z, fsr D8, D9, D10      (kidney_guard)
 LAYOUTS = {0x5B: 3, 0x5C: 6}
+NOISE_BAND_G = 6.0                 # largest resting noise measured: 5.75 g
+BASELINE_TAU_S = 3.0               # how fast the resting value follows a tilt
+LEVEL_STEP_G = 0.3                 # drawn level moves only for a shift this big
 FSR_COUNT = 3
+FSR_ADC_MAX = 4095                 # the reading at rest
+FSR_PULLUP_KOHM = 4.7
 FSR_NAMES = ("D8", "D9", "D10")
-FSR_HEAVY_ADC = 2030               # "Heavy Squeeze" in the sketch, at or below
+# Press bands on the plot, at or below. Set from one held press at each level
+#  (medians 3136, 1645, 771), midway between them in FSR resistance. Plot only:
+#  the sketch's own "Heavy Squeeze" threshold is separate.
+FSR_MEDIUM_ADC = 2450
+FSR_HEAVY_ADC = 1160
 HEADER = struct.Struct("<HIHBB")   # seq, micros, fullScale, count, overruns
 MAX_COUNT = 64                   # sanity limit when resyncing
 OFFSET_WINDOW_S = 5.0              # see StreamReader.offsets
@@ -236,6 +253,51 @@ class StreamReader(threading.Thread):
         return chunks
 
 
+class NoiseGate:
+    """Flattens the resting noise of X, Y and Z for the plot.
+
+    Samples within band_g of an axis's resting value draw as that value, the
+    rest pass through unchanged, so peaks aren't averaged down. The resting
+    value is tracked from the in-band samples only. The drawn level moves
+    only once it has drifted LEVEL_STEP_G away, otherwise the tracking
+    itself would show as a slow wiggle in the flat line.
+    """
+
+    def __init__(self, band_g, sample_rate):
+        self.band_g = band_g
+        self.alpha = 1 / (BASELINE_TAU_S * sample_rate)
+        self.reset()
+
+    def reset(self):
+        self.tracked = None
+        self.level = None
+        self.seen = np.zeros(3)  # in-band samples so far, per axis
+
+    def apply(self, xyz):
+        if not self.band_g:
+            return xyz
+        if self.tracked is None:
+            # Median, so an impact in the first packet can't set the level
+            self.tracked = np.median(xyz, axis=0)
+            self.level = self.tracked.copy()
+        quiet = np.abs(xyz - self.level) <= self.band_g
+        n = quiet.sum(axis=0)
+        self.seen += n
+        used = n > 0
+        mean = (xyz * quiet).sum(axis=0)[used] / n[used]
+        # A plain average until the slow tracking has enough samples
+        weight = np.maximum(1 - (1 - self.alpha) ** n[used],
+                            n[used] / self.seen[used])
+        self.tracked[used] += weight * (mean - self.tracked[used])
+        moved = np.abs(self.tracked - self.level) > LEVEL_STEP_G
+        self.level[moved] = self.tracked[moved]
+        return np.where(quiet, self.level, xyz)
+
+    def zero(self, xyz):
+        """Shifts apply()'s output so each axis rests at 0."""
+        return xyz if self.level is None else xyz - self.level
+
+
 COLUMNS = 5 + FSR_COUNT  # t, x, y, z, magnitude, fsr D8, D9, D10
 
 
@@ -298,6 +360,16 @@ def peak_decimate(rows, first_index, ds):
     return np.concatenate((out, rows[n:]))  # newest partial group as is
 
 
+def fsr_conductance(adc):
+    """FSR conductance in 1/kohm from its reading, 0 at rest.
+
+    Roughly proportional to force, unlike the reading itself, which bunches
+    up harder presses because of the voltage divider.
+    """
+    adc = np.maximum(adc, 1)  # 0 would mean no resistance at all
+    return (FSR_ADC_MAX - adc) / (FSR_PULLUP_KOHM * adc)
+
+
 def nice_step(span):
     """A 1, 2 or 5 times a power of ten step near span/4."""
     raw = span / 4
@@ -356,9 +428,15 @@ def main():
                         default=MAX_SAMPLE_RATE_HZ,
                         help="samples/sec to stream, kidney_guard only "
                              f"(default: {MAX_SAMPLE_RATE_HZ})")
+    parser.add_argument("--noise-band", type=float, default=NOISE_BAND_G,
+                        help="draw samples within this many g of the resting "
+                             "value as flat, 0 shows the raw signal "
+                             f"(default: {NOISE_BAND_G:g})")
     args = parser.parse_args()
     if not 1 <= args.rate <= MAX_SAMPLE_RATE_HZ:
         parser.error(f"--rate must be 1 to {MAX_SAMPLE_RATE_HZ}")
+    if args.noise_band < 0:
+        parser.error("--noise-band can't be negative")
     # The board streams one of every N samples, so the rate is rounded to
     #  1000/N: -r 300 gives 333 samples/sec
     decimation = round(MAX_SAMPLE_RATE_HZ / args.rate)
@@ -377,24 +455,25 @@ def main():
     status = win.addLabel("waiting for data...", row=0, col=0)
 
     axes_plot = win.addPlot(row=1, col=0)
-    axes_plot.setLabel("left", "acceleration", units="g")
+    axes_plot.setLabel("left", "change from rest" if args.noise_band
+                       else "acceleration", units="g")
     axes_plot.addLegend(offset=(10, 10))
     mag_plot = win.addPlot(row=2, col=0)
-    mag_plot.setLabel("left", "|a|", units="g")
+    mag_plot.setLabel("left", "|a| from rest" if args.noise_band else "|a|",
+                      units="g")
     mag_plot.setXLink(axes_plot)
     fsr_plot = win.addPlot(row=3, col=0)
-    fsr_plot.setLabel("left", "FSR (ADC)")
+    fsr_plot.setLabel("left", "FSR")
     fsr_plot.setLabel("bottom", "time", units="s")
-    fsr_plot.addLegend(offset=(10, 10))
     fsr_plot.setXLink(axes_plot)
-    fsr_plot.setYRange(0, 4095, padding=0.02)
-    fsr_plot.invertY(True)  # pull-ups: a press lowers the reading, show it rising
     for plot in (axes_plot, mag_plot, fsr_plot):
         plot.showGrid(x=True, y=True, alpha=0.3)
+        plot.getAxis("left").setWidth(80)  # keeps the time axes lined up
         # Downsampling is done by peak_decimate(), pyqtgraph's own shimmers
         #  while scrolling
     y_ranges = (StableYRange(axes_plot, min_span=1.0),
-                StableYRange(mag_plot, min_span=1.0, floor=0.0))
+                StableYRange(mag_plot, min_span=1.0, floor=0.0),
+                StableYRange(fsr_plot, min_span=1.5, floor=0.0))
 
     curves = [axes_plot.plot(pen=pg.mkPen(color, width=1), name=name,
                              connect="finite")
@@ -405,16 +484,23 @@ def main():
     mag_plot.addItem(pg.InfiniteLine(
         pos=args.threshold, angle=0, pen=pg.mkPen("#888", style=QtCore.Qt.PenStyle.DashLine),
         label=f"{args.threshold:g} g", labelOpts={"position": 0.02}))
-    curves += [fsr_plot.plot(pen=pg.mkPen(color, width=1), name=name,
-                             connect="finite")
-               for name, color in zip(FSR_NAMES,
-                                      ("#986ee2", "#cc6b2c", "#39c5cf"))]
-    fsr_plot.addItem(pg.InfiniteLine(
-        pos=FSR_HEAVY_ADC, angle=0,
-        pen=pg.mkPen("#888", style=QtCore.Qt.PenStyle.DashLine),
-        label=f"heavy squeeze ({FSR_HEAVY_ADC})", labelOpts={"position": 0.02}))
+    curves += [fsr_plot.plot(pen=pg.mkPen(color, width=1), connect="finite")
+               for color in ("#986ee2", "#cc6b2c", "#39c5cf")]
+    medium = fsr_conductance(FSR_MEDIUM_ADC)
+    heavy = fsr_conductance(FSR_HEAVY_ADC)
+    for level in (medium, heavy):
+        fsr_plot.addItem(pg.InfiniteLine(
+            pos=level, angle=0,
+            pen=pg.mkPen("#888", style=QtCore.Qt.PenStyle.DashLine)))
+    # The axis names the press bands instead of showing numbers
+    fsr_plot.getAxis("left").setTicks([[
+        (medium / 2, "light"),
+        ((medium + heavy) / 2, "medium"),
+        (heavy + (heavy - medium), "strong")]])
+    fsr_plot.showGrid(x=True, y=False)  # the band lines replace the y grid
 
     ring = RingBuffer(int(args.window * MAX_SAMPLE_RATE_HZ))
+    gate = NoiseGate(args.noise_band, MAX_SAMPLE_RATE_HZ / decimation)
     state = {"paused": False, "last_samples": 0, "last_time": time.monotonic(),
              "rate": 0.0}
 
@@ -431,10 +517,12 @@ def main():
         for t, xyz, fsr, gap, reset in reader.take_chunks():
             if reset:
                 ring.clear()
+                gate.reset()
             if gap:  # a NaN row breaks the line across dropped packets
                 ring.extend(np.full((1, COLUMNS), np.nan))
+            xyz = gate.zero(gate.apply(xyz))
             mag = np.linalg.norm(xyz, axis=1)
-            ring.extend(np.column_stack((t, xyz, mag, fsr)))
+            ring.extend(np.column_stack((t, xyz, mag, fsr_conductance(fsr))))
 
         now = time.monotonic()
         if now - state["last_time"] >= 1.0:
@@ -445,10 +533,13 @@ def main():
         recording = (f"  recording to {os.path.basename(args.output)}"
                      if args.output else "")
         paused = "  PAUSED (space)" if state["paused"] else ""
+        gated = (f"  noise band: {args.noise_band:g} g"
+                 if args.noise_band else "")
         status.setText(
             f"{state['rate']:.0f} samples/s  dropped packets: "
             f"{reader.dropped_packets}  sensor overruns: {reader.overruns}  "
-            f"bad packets: {reader.parser.bad_packets}{recording}{paused}")
+            f"bad packets: {reader.parser.bad_packets}{gated}{recording}"
+            f"{paused}")
 
         if state["paused"]:
             return
@@ -481,6 +572,7 @@ def main():
         in_view = data[:, 0] <= t_end
         y_ranges[0].update(data[in_view, 1:4])
         y_ranges[1].update(data[in_view, 4])
+        y_ranges[2].update(data[in_view, 5:8])
 
     timer = QtCore.QTimer()
     timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
