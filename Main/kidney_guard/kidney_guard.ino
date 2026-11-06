@@ -27,9 +27,11 @@ const float INT_THRESHOLD_G = 50.0;
 const unsigned long IMPACT_REARM_MS = 20;
 
 // FSR voltage dividers on D8, D9, D10 (GPIO7-9, analog A8-A10), each with
-//  a 10k pull-down to GND. All three are streamed; the log and the
+//  a 4.7k pull-up to 3.3V and the FSR to GND, so a reading is ~4095 at rest
+//  and falls as the FSR is pressed. All three are streamed; the log and the
 //  "Heavy Squeeze" check use the first one (D8).
 const int FSR_COUNT = 3;
+const int FSR_ADC_MAX = 4095; // 12-bit ADC, also the reading at rest
 const int FSR_PINS[FSR_COUNT] = {A8, A9, A10};
 
 // CSV event log on internal flash (LittleFS on the "spiffs" partition of
@@ -118,7 +120,7 @@ int streamDecimation = 1;     // stream one of every N sensor samples
 int groupSamples = 0;         // sensor samples seen for the next streamed one
 int32_t groupMag2 = 0;        // largest x^2 + y^2 + z^2 in the group, counts
 int16_t groupXyz[3];          // the sample it belongs to
-uint16_t groupFsr[FSR_COUNT]; // largest reading of each FSR in the group
+uint16_t groupFsr[FSR_COUNT]; // lowest reading of each FSR in the group
 
 void setup() 
 {
@@ -235,7 +237,7 @@ const unsigned long DIAG_INTERVAL_MS = 1000;    // diagnostics, 1 print/sec
 
 // A window's peak is only printed if one of these thresholds is reached
 const float ACCEL_PRINT_THRESHOLD_G = 100.0; // any single axis
-const int FSR_HEAVY_ADC = 2800;              // "Heavy Squeeze"
+const int FSR_HEAVY_ADC = 2030;              // "Heavy Squeeze", at or below
 
 void loop()
 {
@@ -247,7 +249,7 @@ void loop()
   static float maxAxisG = 0;            // largest |x|, |y| or |z| in window
   static float peakAxisG = 0;           // that reading with its sign
   static char peakAxis = 'x';           // axis it was measured on
-  static int maxFsrAdc = 0;
+  static int minFsrAdc = FSR_ADC_MAX;    // lowest reading = hardest press
   static unsigned int pollCount = 0;    // STATUS_REG polls since diagnostics
   static unsigned int newDataCount = 0; // new sensor samples processed
   static unsigned int overrunCount = 0; // polls where a sample was missed
@@ -343,23 +345,23 @@ void loop()
       peakAxis = axis;
     }
 
-    if (fsr[0] > maxFsrAdc)
+    if (fsr[0] < minFsrAdc)
     {
-      maxFsrAdc = fsr[0];
+      minFsrAdc = fsr[0];
     }
   }
 
   if (millis() - printTimer >= PRINT_INTERVAL_MS)
   {
     printTimer = millis();
-    if (maxAxisG >= ACCEL_PRINT_THRESHOLD_G || maxFsrAdc >= FSR_HEAVY_ADC)
+    if (maxAxisG >= ACCEL_PRINT_THRESHOLD_G || minFsrAdc <= FSR_HEAVY_ADC)
     {
       char row[160];
       int len = snprintf(row, sizeof(row),
         "%lu,%lu,%.2f,%.2f,%.2f,%.2f,%.2f,%c,%d,%.2f\n",
         (unsigned long)bootCount, printTimer, maxGx, maxGy, maxGz,
-        maxCombined, peakAxisG, peakAxis, maxFsrAdc,
-        (maxFsrAdc * 3.3) / 4095.0); // ESP32-S3 logic is 3.3V
+        maxCombined, peakAxisG, peakAxis, minFsrAdc,
+        (minFsrAdc * 3.3) / FSR_ADC_MAX); // ESP32-S3 logic is 3.3V
       len = min(len, (int)sizeof(row) - 1); // snprintf returns untruncated length
       if (!streamMode)
       {
@@ -373,7 +375,7 @@ void loop()
     maxAxisG = 0;
     peakAxisG = 0;
     peakAxis = 'x';
-    maxFsrAdc = 0;
+    minFsrAdc = FSR_ADC_MAX;
   }
 
   if (millis() - diagTimer >= DIAG_INTERVAL_MS)
@@ -479,8 +481,8 @@ bool readAxesBurst(int16_t &x, int16_t &y, int16_t &z)
 
 // Collects streamDecimation sensor samples and streams the one with the
 //  largest |a|, so decimation doesn't hide a short impact peak. Each FSR
-//  sends its largest reading of the group. Overruns are counted for every
-//  sensor sample, streamed or not.
+//  sends its lowest reading of the group, its hardest press. Overruns are
+//  counted for every sensor sample, streamed or not.
 void streamSample(int16_t x, int16_t y, int16_t z,
                   const uint16_t fsr[FSR_COUNT], bool overrun)
 {
@@ -498,7 +500,7 @@ void streamSample(int16_t x, int16_t y, int16_t z,
   }
   for (int i = 0; i < FSR_COUNT; i++)
   {
-    if (groupSamples == 0 || fsr[i] > groupFsr[i])
+    if (groupSamples == 0 || fsr[i] < groupFsr[i])
     {
       groupFsr[i] = fsr[i];
     }

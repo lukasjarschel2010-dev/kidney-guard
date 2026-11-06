@@ -6,8 +6,8 @@ and 't' (back to text output) when it closes.
 
 -r lowers the rate kidney_guard streams at (the sensor itself keeps running
 at 1 kHz). Each streamed sample is the one with the largest |a| of its
-group, so impact peaks survive, and each FSR is its largest reading; the
-peak's time is only accurate to one streamed sample period, though.
+group, so impact peaks survive, and each FSR is its lowest reading (hardest
+press); the peak's time is only accurate to one streamed sample period, though.
 
 Shows the last few seconds of X/Y/Z and the vector magnitude, with the
 impact threshold drawn in, and the FSRs on D8, D9 and D10 when the sketch
@@ -44,7 +44,7 @@ SYNC0 = 0xA5
 LAYOUTS = {0x5B: 3, 0x5C: 6}
 FSR_COUNT = 3
 FSR_NAMES = ("D8", "D9", "D10")
-FSR_HEAVY_ADC = 2800               # "Heavy Squeeze" in the sketch
+FSR_HEAVY_ADC = 2030               # "Heavy Squeeze" in the sketch, at or below
 HEADER = struct.Struct("<HIHBB")   # seq, micros, fullScale, count, overruns
 MAX_COUNT = 64                   # sanity limit when resyncing
 OFFSET_WINDOW_S = 5.0              # see StreamReader.offsets
@@ -388,6 +388,7 @@ def main():
     fsr_plot.addLegend(offset=(10, 10))
     fsr_plot.setXLink(axes_plot)
     fsr_plot.setYRange(0, 4095, padding=0.02)
+    fsr_plot.invertY(True)  # pull-ups: a press lowers the reading, show it rising
     for plot in (axes_plot, mag_plot, fsr_plot):
         plot.showGrid(x=True, y=True, alpha=0.3)
         # Downsampling is done by peak_decimate(), pyqtgraph's own shimmers
