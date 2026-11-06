@@ -14,14 +14,31 @@ const uint8_t AUTO_INC = 0x80;   // MSB of sub-address = auto-increment
 const uint8_t BDU_BIT = 0x80;    // CTRL_REG4 bit 7: Block Data Update
 const uint8_t ZYXDA_BIT = 0x08;  // STATUS_REG bit 3: new X, Y, Z data ready
 const uint8_t ZYXOR_BIT = 0x80;  // STATUS_REG bit 7: X, Y, Z data overrun
+const uint8_t INT1_SRC_ADDR = 0x31; // reading it clears the latched INT1
 
-// FSR voltage divider on D8 (GPIO7, analog A8) with a 10k pull-down to GND
-const int FSR_PIN = A8;
+const int ACCEL_RANGE_G = 200;      // must match setFullScale()
+
+// Accelerometer INT1 is wired to D0. It goes high when |x|, |y| or |z| exceeds
+//  INT_THRESHOLD_G and stays high (latched) until INT1_SRC is read.
+const int INT1_PIN = D0;
+const float INT_THRESHOLD_G = 50.0;
+// While an axis stays over threshold INT1 fires again on every sample, so
+//  an impact only counts as over once INT1 has been quiet for this long.
+const unsigned long IMPACT_REARM_MS = 20;
+
+// FSR voltage dividers on D8, D9, D10 (GPIO7-9, analog A8-A10), each with
+//  a 10k pull-down to GND. All three are streamed; the log and the
+//  "Heavy Squeeze" check use the first one (D8).
+const int FSR_COUNT = 3;
+const int FSR_PINS[FSR_COUNT] = {A8, A9, A10};
 
 // CSV event log on internal flash (LittleFS on the "spiffs" partition of
 //  the default partition scheme, ~1.5 MB). Rows are buffered in RAM and
-//  written once an event is over, so flash writes don't stall sampling
-//  during an impact.
+//  written once an event is over, or when the buffer is full. The writing
+//  is done by logTask on core 0 while loop() fills a second buffer, since a
+//  flush takes ~0.4 s on a nearly full partition and would stall sampling.
+//  Even so, the ESP32 pauses both cores for each flash erase or program,
+//  so a flush still costs some samples, just far fewer.
 // The log is a ring buffer of numbered segment files (/log/00000001.csv,
 //  ...) holding rows only, the header is added when dumping. When the
 //  partition is full the oldest segment is deleted, so the newest data is
@@ -34,17 +51,73 @@ const size_t LOG_BUFFER_SIZE = 4096;
 const size_t LOG_SEGMENT_SIZE = 65536;         // ~1500 rows, ~4% of the log
 const unsigned long LOG_FLUSH_QUIET_MS = 1000; // flush after 1 s w/o events
 const size_t LOG_FREE_MARGIN = 8192;           // keep 2 flash blocks spare
-char logBuffer[LOG_BUFFER_SIZE];
-size_t logLen = 0;
+char logBuffers[2][LOG_BUFFER_SIZE];
+int logFill = 0;            // buffer loop() is filling
+size_t logLen = 0;          // bytes in it
+struct LogWrite
+{
+  int buffer;
+  size_t len;
+};
+QueueHandle_t logQueue;     // full buffers for logTask to write
+SemaphoreHandle_t logSpare; // available while the other buffer is free,
+                            //  i.e. logTask isn't writing it
+uint32_t logRowsDropped = 0; // rows lost because both buffers were full
 bool logReady = false;
 uint32_t oldestSegment = 1; // segment numbers only grow, so oldest..newest
 uint32_t newestSegment = 1; //  is the order of the rows
+// Bytes in the newest segment, kept by writeLog() so a flush doesn't have
+//  to look it up. SIZE_MAX until read once after boot or erase: that first
+//  write also makes sure the rest of the segment fits on the partition.
+size_t newestSegmentSize = SIZE_MAX;
 uint32_t bootCount = 0; // distinguishes power cycles, since ms restarts at 0
+
+// Stream mode (serial command 's', back to text with 't'): every raw
+//  sample goes out as binary packets for Tools/plot_stream.py, which sends
+//  's' itself when it connects. The live text rows and diagnostics are
+//  not printed then, since they would garble the Serial Monitor view
+//  anyway; the CSV log on flash keeps running as normal.
+// Command 'r<N>' (e.g. "r10\n") streams only one of every N sensor samples,
+//  see streamSample(). The sensor, impact detection and the log keep
+//  running at the full 1 kHz.
+// Packet layout, little-endian. Examples/HLIS331DL_Stream sends the same
+//  without the FSR readings, under sync 0xA5 0x5B:
+//  0xA5 0x5C        sync, the second byte names the layout
+//  uint16 seq       increments per packet, so the host can spot drops
+//  uint32 micros    micros() when the packet's last sample was read
+//  uint16 fullScale +/- g range of the counts below
+//  uint8  count     samples in this packet (packetTarget())
+//  uint8  overruns  samples the sensor overwrote before we read them
+//  count times:
+//   int16  x,y,z    raw 12-bit accelerometer counts
+//   uint16 fsr[3]   12-bit ADC readings of D8, D9, D10
+//  uint8  checksum  sum of all bytes after the sync, mod 256
+const uint8_t SYNC0 = 0xA5;
+const uint8_t SYNC1 = 0x5C;
+const int SAMPLES_PER_PACKET = 10; // at full rate: 10 ms per packet,
+                                   //  100 packets/sec
+const int SAMPLE_BYTES = 3 * 2 + FSR_COUNT * 2;
+const int PACKET_BYTES = 2 + 2 + 4 + 2 + 1 + 1 + SAMPLES_PER_PACKET * SAMPLE_BYTES + 1;
+bool streamMode = false;
+uint8_t packet[PACKET_BYTES];
+int packetSamples = 0;  // samples in the packet being filled
+uint8_t packetOverruns = 0;
+uint16_t packetSeq = 0;
+const int MAX_STREAM_DECIMATION = 1000; // down to 1 sample/sec
+int streamDecimation = 1;     // stream one of every N sensor samples
+int groupSamples = 0;         // sensor samples seen for the next streamed one
+int32_t groupMag2 = 0;        // largest x^2 + y^2 + z^2 in the group, counts
+int16_t groupXyz[3];          // the sample it belongs to
+uint16_t groupFsr[FSR_COUNT]; // largest reading of each FSR in the group
 
 void setup() 
 {
   // put your setup code here, to run once:
-  pinMode(FSR_PIN, INPUT); // FSR analog input
+  for (int i = 0; i < FSR_COUNT; i++)
+  {
+    pinMode(FSR_PINS[i], INPUT); // FSR analog inputs
+  }
+  pinMode(INT1_PIN, INPUT); // Accelerometer INT1
   Wire.begin();           // Turns on I2C communication
   Wire.setClock(400000);  // 400 kHz fast-mode I2C, so STATUS_REG can be
                           //  polled several times per 1 ms sample
@@ -54,12 +127,35 @@ void setup()
                           //  the power up bit on the accelerometer.
                           //  Also zeroes out all accelerometer
                           //  registers that are user writable.
-  // INT1/INT2 are not wired to the XIAO, so no hardware interrupts are
-  //  configured. New samples are detected by polling STATUS_REG (ZYXDA).
+  // New samples are detected by polling STATUS_REG (ZYXDA). INT1 is only
+  //  used as a threshold event counter, see below.
   xl.setFullScale(LIS331::MED_RANGE); // +/-200g
   xl.setODR(LIS331::DR_1000HZ); // Accelerometer output data rate: 1000 Hz
   enableBlockDataUpdate(); // MUST be called AFTER setFullScale(), which
                           //  clears bit 7 of CTRL_REG4
+  // This next section configures an interrupt. It will cause pin
+  //  INT1 on the accelerometer to go high when the absolute value
+  //  of the reading on any axis exceeds INT_THRESHOLD_G.
+  xl.intSrcConfig(LIS331::INT_SRC, 1); // Select the source of the
+                          //  signal which appears on pin INT1. In
+                          //  this case, we want the corresponding
+                          //  interrupt's status to appear.
+  xl.latchInterrupt(true, 1); // Hold INT1 high until INT1_SRC is
+                          //  read, so we count each event once and
+                          //  can't miss a short one. Must come AFTER
+                          //  intSrcConfig(), which clears this bit.
+  xl.setIntDuration(0, 1); // Fire on the first sample over threshold.
+  // Threshold register is 7 bits, compared against counts/16. At
+  //  +/-200g one register LSB is 16 * 200/2047 = ~1.56g.
+  const float gPerThsLsb = 16.0 * ACCEL_RANGE_G / 2047;
+  int ths = (int)(INT_THRESHOLD_G / gPerThsLsb + 0.5);
+  if (ths > 127) ths = 127;
+  xl.setIntThreshold(ths, 1);
+  // INT1_CFG's AOI bit is left at 0 (by begin()), so the axes are
+  //  OR-combined: any one axis over threshold fires INT1.
+  xl.enableInterrupt(LIS331::X_AXIS, LIS331::TRIG_ON_HIGH, 1, true);
+  xl.enableInterrupt(LIS331::Y_AXIS, LIS331::TRIG_ON_HIGH, 1, true);
+  xl.enableInterrupt(LIS331::Z_AXIS, LIS331::TRIG_ON_HIGH, 1, true);
   Serial.begin(115200);
   unsigned long serialWaitStart = millis();
   while (!Serial && millis() - serialWaitStart < 2000)
@@ -79,25 +175,39 @@ void setup()
   {
     scanLogSegments();
     migrateLegacyLog();
+    logQueue = xQueueCreate(1, sizeof(LogWrite));
+    logSpare = xSemaphoreCreateBinary();
+    xSemaphoreGive(logSpare);
+    // loop() runs on core 1, so flash writes don't hold it up
+    xTaskCreatePinnedToCore(logTask, "log", 8192, NULL, 1, NULL, 0);
   }
   printLogInfo();
-  Serial.println("# Commands: d = dump log, e = erase log, i = log info");
+  Serial.println("# Commands: d = dump log, e = erase log, i = log info, "
+                 "s = stream to plot_stream.py, t = text output, "
+                 "r<N> = stream every Nth sample");
   Serial.print(LOG_HEADER); // header for the live rows
 
   // Verify accelerometer configuration: expect BDU = 1 and FS = 01 (200g)
-  uint8_t ctrlReg4 = readRegister(CTRL_REG4_ADDR);
-  Serial.print("CTRL_REG4: 0b");
-  for (int bit = 7; bit >= 0; bit--)
+  uint8_t ctrlReg4;
+  if (readRegister(CTRL_REG4_ADDR, ctrlReg4))
   {
-    Serial.print((ctrlReg4 >> bit) & 1);
+    Serial.print("CTRL_REG4: 0b");
+    for (int bit = 7; bit >= 0; bit--)
+    {
+      Serial.print((ctrlReg4 >> bit) & 1);
+    }
+    Serial.print(" (0x");
+    Serial.print(ctrlReg4, HEX);
+    Serial.print(") BDU: ");
+    Serial.print((ctrlReg4 & BDU_BIT) ? "ON" : "OFF");
+    Serial.print(" FS bits: ");
+    Serial.print((ctrlReg4 >> 5) & 1);
+    Serial.println((ctrlReg4 >> 4) & 1);
   }
-  Serial.print(" (0x");
-  Serial.print(ctrlReg4, HEX);
-  Serial.print(") BDU: ");
-  Serial.print((ctrlReg4 & BDU_BIT) ? "ON" : "OFF");
-  Serial.print(" FS bits: ");
-  Serial.print((ctrlReg4 >> 5) & 1);
-  Serial.println((ctrlReg4 >> 4) & 1);
+  else
+  {
+    Serial.println("# I2C ERROR - could not read CTRL_REG4");
+  }
 
   Serial.flush();           // let the startup messages above go out first
   Serial.setTxTimeoutMs(0); // Never block on Serial from here on: with USB
@@ -106,7 +216,6 @@ void setup()
                             //  to 100 ms each. Unread output is dropped.
 }
 
-const int ACCEL_RANGE_G = 200;                  // must match setFullScale()
 const unsigned long PRINT_INTERVAL_MS = 100;    // peak window, max 10 prints/sec
 const unsigned long DIAG_INTERVAL_MS = 1000;    // diagnostics, 1 print/sec
 
@@ -128,22 +237,68 @@ void loop()
   static unsigned int pollCount = 0;    // STATUS_REG polls since diagnostics
   static unsigned int newDataCount = 0; // new sensor samples processed
   static unsigned int overrunCount = 0; // polls where a sample was missed
+  static unsigned int intEventCount = 0; // impacts seen on INT1
+  static unsigned int i2cErrorCount = 0; // failed accelerometer reads
+  static bool inImpact = false;
+  static unsigned long lastIntMs = 0;
 
-  // Software data-ready: poll STATUS_REG every loop pass (INT1/INT2 are not
-  //  wired) and only read the axes when it says a new sample is ready.
+  if (digitalRead(INT1_PIN) == HIGH)
+  {
+    uint8_t intSource;
+    if (!readRegister(INT1_SRC_ADDR, intSource)) // clears the latch
+    {
+      i2cErrorCount++; // still latched, so the next pass reads it again
+    }
+    if (!inImpact)
+    {
+      intEventCount++; // first INT1 of a new impact
+      inImpact = true;
+    }
+    lastIntMs = millis();
+  }
+  else if (inImpact && millis() - lastIntMs >= IMPACT_REARM_MS)
+  {
+    inImpact = false; // back under threshold, ready for the next impact
+  }
+
+  // Software data-ready: poll STATUS_REG every loop pass and only read the
+  //  axes when it says a new sample is ready.
   //  Reading STATUS_REG alone does not clear ZYXDA, only reading the output
   //  registers does, so a sample arriving mid-read can't be lost unseen.
-  uint8_t status = readRegister(STATUS_REG_ADDR);
+  //  A failed read is skipped rather than returning from loop(), so the
+  //  timers, log and serial commands keep running if the sensor drops out.
+  uint8_t status = 0;
+  if (!readRegister(STATUS_REG_ADDR, status))
+  {
+    i2cErrorCount++;
+  }
   pollCount++;
   if (status & ZYXOR_BIT)
   {
     overrunCount++;  // a sample was overwritten before it was read
   }
+  int16_t x, y, z;
+  bool newSample = false;
   if (status & ZYXDA_BIT)
   {
+    newSample = readAxesBurst(x, y, z);
+    if (!newSample)
+    {
+      i2cErrorCount++; // ZYXDA stays set, so the next pass tries again
+    }
+  }
+  if (newSample)
+  {
     newDataCount++;
-    int16_t x, y, z;
-    readAxesBurst(x, y, z);
+    uint16_t fsr[FSR_COUNT];
+    for (int i = 0; i < FSR_COUNT; i++)
+    {
+      fsr[i] = analogRead(FSR_PINS[i]); // 12-bit ADC (0 to 4095)
+    }
+    if (streamMode)
+    {
+      streamSample(x, y, z, fsr, status & ZYXOR_BIT);
+    }
     float gx = xl.convertToG(ACCEL_RANGE_G, x); // Convert raw counts to
     float gy = xl.convertToG(ACCEL_RANGE_G, y); //  g-force, using the
     float gz = xl.convertToG(ACCEL_RANGE_G, z); //  current full scale.
@@ -174,10 +329,9 @@ void loop()
       peakAxis = axis;
     }
 
-    int fsrAdc = analogRead(FSR_PIN); // 12-bit ADC (0 to 4095)
-    if (fsrAdc > maxFsrAdc)
+    if (fsr[0] > maxFsrAdc)
     {
-      maxFsrAdc = fsrAdc;
+      maxFsrAdc = fsr[0];
     }
   }
 
@@ -193,7 +347,10 @@ void loop()
         maxCombined, peakAxisG, peakAxis, maxFsrAdc,
         (maxFsrAdc * 3.3) / 4095.0); // ESP32-S3 logic is 3.3V
       len = min(len, (int)sizeof(row) - 1); // snprintf returns untruncated length
-      Serial.print(row);
+      if (!streamMode)
+      {
+        Serial.print(row);
+      }
       appendLog(row, len);
       lastEventMs = printTimer;
     }
@@ -210,25 +367,35 @@ void loop()
     unsigned long now = millis();
     unsigned long elapsedMs = now - diagTimer;
     diagTimer = now;
-    // Sensor sample rate over the actual window (expect ~1000 Hz)
-    Serial.print("[diag] samples: ");
-    Serial.print(newDataCount);
-    Serial.print(" rate: ");
-    Serial.print(newDataCount * 1000UL / elapsedMs);
-    Serial.print("Hz polls: ");
-    Serial.print(pollCount);
-    Serial.print(" overrun: ");
-    Serial.println(overrunCount);
+    if (!streamMode)
+    {
+      // Sensor sample rate over the actual window (expect ~1000 Hz)
+      Serial.print("[diag] samples: ");
+      Serial.print(newDataCount);
+      Serial.print(" rate: ");
+      Serial.print(newDataCount * 1000UL / elapsedMs);
+      Serial.print("Hz polls: ");
+      Serial.print(pollCount);
+      Serial.print(" overrun: ");
+      Serial.print(overrunCount);
+      Serial.print(" int events: ");
+      Serial.print(intEventCount);
+      Serial.print(" i2c errs: ");
+      Serial.println(i2cErrorCount);
+    }
     pollCount = 0;
     newDataCount = 0;
     overrunCount = 0;
+    intEventCount = 0;
+    i2cErrorCount = 0;
   }
 
   // Write buffered rows to flash once the event is over (no new rows for
-  //  LOG_FLUSH_QUIET_MS), so the write never lands mid-impact
+  //  LOG_FLUSH_QUIET_MS), so the write never lands mid-impact. If logTask
+  //  is still busy, this tries again on the next pass.
   if (logLen > 0 && millis() - lastEventMs >= LOG_FLUSH_QUIET_MS)
   {
-    flushLog();
+    queueLogFlush();
   }
 
   if (Serial.available())
@@ -237,14 +404,20 @@ void loop()
   }
 }
 
-// Reads a single accelerometer register.
-uint8_t readRegister(uint8_t reg)
+// Reads a single accelerometer register. Returns false on an I2C error,
+//  leaving value untouched. Only requestFrom() can report one: with
+//  endTransmission(false) nothing is sent until then, so it always returns 0.
+bool readRegister(uint8_t reg, uint8_t &value)
 {
   Wire.beginTransmission(LIS331_ADDR);
   Wire.write(reg);
   Wire.endTransmission(false);    // repeated START, keep the bus
-  Wire.requestFrom(LIS331_ADDR, (uint8_t)1);
-  return Wire.read();
+  if (Wire.requestFrom(LIS331_ADDR, (uint8_t)1) != 1)
+  {
+    return false;
+  }
+  value = Wire.read();
+  return true;
 }
 
 // Sets the BDU bit so the output registers are not updated until both
@@ -252,7 +425,11 @@ uint8_t readRegister(uint8_t reg)
 //  prevents torn readings that mix bytes from two samples.
 void enableBlockDataUpdate()
 {
-  uint8_t reg = readRegister(CTRL_REG4_ADDR);
+  uint8_t reg;
+  if (!readRegister(CTRL_REG4_ADDR, reg))
+  {
+    return; // don't write a guess; the check in setup() reports the failure
+  }
 
   Wire.beginTransmission(LIS331_ADDR);
   Wire.write(CTRL_REG4_ADDR);
@@ -262,15 +439,19 @@ void enableBlockDataUpdate()
 
 // Reads all six output bytes (X_L, X_H, Y_L, Y_H, Z_L, Z_H) in a single
 //  I2C transaction using register auto-increment, instead of the six
-//  separate transactions done by xl.readAxes().
-void readAxesBurst(int16_t &x, int16_t &y, int16_t &z)
+//  separate transactions done by xl.readAxes(). Returns false on an I2C
+//  error, leaving x, y and z untouched.
+bool readAxesBurst(int16_t &x, int16_t &y, int16_t &z)
 {
-  uint8_t data[6] = {0};
+  uint8_t data[6];
   Wire.beginTransmission(LIS331_ADDR);
   Wire.write(OUT_X_L_ADDR | AUTO_INC);
   Wire.endTransmission(false);    // repeated START, keep the bus
-  Wire.requestFrom(LIS331_ADDR, (uint8_t)6);
-  for (int i = 0; i < 6 && Wire.available(); i++)
+  if (Wire.requestFrom(LIS331_ADDR, (uint8_t)6) != 6)
+  {
+    return false;
+  }
+  for (int i = 0; i < 6; i++)
   {
     data[i] = Wire.read();
   }
@@ -279,6 +460,87 @@ void readAxesBurst(int16_t &x, int16_t &y, int16_t &z)
   x = (int16_t)(data[0] | data[1] << 8) >> 4;
   y = (int16_t)(data[2] | data[3] << 8) >> 4;
   z = (int16_t)(data[4] | data[5] << 8) >> 4;
+  return true;
+}
+
+// Collects streamDecimation sensor samples and streams the one with the
+//  largest |a|, so decimation doesn't hide a short impact peak. Each FSR
+//  sends its largest reading of the group. Overruns are counted for every
+//  sensor sample, streamed or not.
+void streamSample(int16_t x, int16_t y, int16_t z,
+                  const uint16_t fsr[FSR_COUNT], bool overrun)
+{
+  if (overrun && packetOverruns < 255)
+  {
+    packetOverruns++;
+  }
+  int32_t mag2 = (int32_t)x * x + (int32_t)y * y + (int32_t)z * z;
+  if (groupSamples == 0 || mag2 > groupMag2)
+  {
+    groupMag2 = mag2;
+    groupXyz[0] = x;
+    groupXyz[1] = y;
+    groupXyz[2] = z;
+  }
+  for (int i = 0; i < FSR_COUNT; i++)
+  {
+    if (groupSamples == 0 || fsr[i] > groupFsr[i])
+    {
+      groupFsr[i] = fsr[i];
+    }
+  }
+  if (++groupSamples < streamDecimation)
+  {
+    return;
+  }
+  groupSamples = 0;
+  addPacketSample(groupXyz, groupFsr);
+}
+
+// Samples per packet: SAMPLES_PER_PACKET at full rate, fewer when
+//  decimating, so a packet still goes out about every 10 ms (or with every
+//  sample, below 100 samples/sec) instead of the plot lagging behind.
+int packetTarget()
+{
+  return max(1, SAMPLES_PER_PACKET / streamDecimation);
+}
+
+// Adds a sample to the stream packet and sends the packet when it is full.
+//  A packet that doesn't fit in the USB transmit buffer is dropped whole
+//  (the host sees the gap in seq) rather than sent in part.
+void addPacketSample(const int16_t xyz[3], const uint16_t fsr[FSR_COUNT])
+{
+  uint32_t sampleMicros = micros();
+  uint8_t *sample = &packet[12 + packetSamples * SAMPLE_BYTES];
+  memcpy(sample, xyz, 3 * sizeof(int16_t)); // ESP32 is LE
+  memcpy(sample + 3 * sizeof(int16_t), fsr, FSR_COUNT * sizeof(uint16_t));
+  if (++packetSamples < packetTarget())
+  {
+    return;
+  }
+  int packetBytes = 12 + packetSamples * SAMPLE_BYTES + 1;
+  packet[0] = SYNC0;
+  packet[1] = SYNC1;
+  packet[2] = packetSeq & 0xFF;
+  packet[3] = packetSeq >> 8;
+  memcpy(&packet[4], &sampleMicros, 4);
+  packet[8] = ACCEL_RANGE_G & 0xFF;
+  packet[9] = ACCEL_RANGE_G >> 8;
+  packet[10] = packetSamples;
+  packet[11] = packetOverruns;
+  uint8_t sum = 0;
+  for (int i = 2; i < packetBytes - 1; i++)
+  {
+    sum += packet[i];
+  }
+  packet[packetBytes - 1] = sum;
+  if (Serial.availableForWrite() >= packetBytes)
+  {
+    Serial.write(packet, packetBytes);
+  }
+  packetSeq++;
+  packetSamples = 0;
+  packetOverruns = 0;
 }
 
 void segmentPath(char *path, size_t size, uint32_t segment)
@@ -344,56 +606,119 @@ void migrateLegacyLog()
 
 // Adds a CSV row to the RAM buffer. Only flushes here if the buffer is
 //  full (a very long event), otherwise the flush waits for a quiet period.
+//  If logTask is still writing the other buffer the row is dropped, which
+//  takes a buffer filling faster than one flush.
 void appendLog(const char *row, int len)
 {
   if (!logReady || len <= 0)
   {
     return;
   }
-  if (logLen + len > LOG_BUFFER_SIZE)
+  if (logLen + len > LOG_BUFFER_SIZE && !queueLogFlush())
   {
-    flushLog();
+    logRowsDropped++;
+    return;
   }
-  memcpy(logBuffer + logLen, row, len);
+  memcpy(logBuffers[logFill] + logLen, row, len);
   logLen += len;
 }
 
-// Appends the RAM buffer to the newest segment. Starts a new segment when
-//  the current one is full, and deletes the oldest segments until the
-//  rows fit, so the log never stops and always keeps the newest data.
-void flushLog()
+// Hands the filled buffer to logTask and switches to the other one.
+//  Returns false, keeping the rows, while logTask is still writing.
+bool queueLogFlush()
 {
   if (!logReady || logLen == 0)
   {
+    return true;
+  }
+  if (xSemaphoreTake(logSpare, 0) != pdTRUE)
+  {
+    return false;
+  }
+  LogWrite w = {logFill, logLen};
+  xQueueSend(logQueue, &w, portMAX_DELAY); // free, logSpare guarantees it
+  logFill ^= 1;
+  logLen = 0;
+  return true;
+}
+
+// Hands over any buffered rows and waits until logTask has written them,
+//  so the log files can be read or removed.
+void finishLogWrites()
+{
+  if (!logReady)
+  {
     return;
   }
+  while (!queueLogFlush())
+  {
+    delay(1); // logTask is busy with the other buffer
+  }
+  xSemaphoreTake(logSpare, portMAX_DELAY); // free again once it's done
+  xSemaphoreGive(logSpare);
+}
+
+// Core 0: writes each buffer loop() hands over, then frees it.
+void logTask(void *)
+{
+  LogWrite w;
+  for (;;)
+  {
+    xQueueReceive(logQueue, &w, portMAX_DELAY);
+    writeLog(logBuffers[w.buffer], w.len);
+    xSemaphoreGive(logSpare);
+  }
+}
+
+// Appends rows to the newest segment. Starts a new segment when the
+//  current one is full, and deletes the oldest segments until the rows
+//  fit, so the log never stops and always keeps the newest data.
+// Free space is only checked when a segment starts (and on the first
+//  write after boot), for the whole rest of the segment: usedBytes() walks
+//  the entire filesystem, and every flash read pauses loop() on the other
+//  core too, so checking on every flush cost ~200 samples each time.
+void writeLog(const char *rows, size_t len)
+{
   char path[32];
   segmentPath(path, sizeof(path), newestSegment);
-  size_t segmentSize = 0;
-  if (LittleFS.exists(path))
+  bool checkRoom = false;
+  if (newestSegmentSize == SIZE_MAX)
   {
-    File f = LittleFS.open(path, FILE_READ);
-    segmentSize = f.size();
-    f.close();
+    newestSegmentSize = 0;
+    if (LittleFS.exists(path))
+    {
+      File f = LittleFS.open(path, FILE_READ);
+      newestSegmentSize = f.size();
+      f.close();
+    }
+    checkRoom = true;
   }
-  if (segmentSize > 0 && segmentSize + logLen > LOG_SEGMENT_SIZE)
+  if (newestSegmentSize > 0 && newestSegmentSize + len > LOG_SEGMENT_SIZE)
   {
     newestSegment++;
     segmentPath(path, sizeof(path), newestSegment);
+    newestSegmentSize = 0;
+    checkRoom = true;
   }
-  while (LittleFS.totalBytes() - LittleFS.usedBytes() < logLen + LOG_FREE_MARGIN
-         && oldestSegment < newestSegment)
+  if (checkRoom)
   {
-    char oldPath[32];
-    segmentPath(oldPath, sizeof(oldPath), oldestSegment);
-    LittleFS.remove(oldPath);
-    oldestSegment++;
-  }
-  if (LittleFS.totalBytes() - LittleFS.usedBytes() < logLen + LOG_FREE_MARGIN)
-  {
-    logLen = 0; // only possible if something else fills the partition
-    Serial.println("# LOG ERROR - no space left, rows dropped");
-    return;
+    size_t needed = LOG_SEGMENT_SIZE - newestSegmentSize + LOG_FREE_MARGIN;
+    while (LittleFS.totalBytes() - LittleFS.usedBytes() < needed
+           && oldestSegment < newestSegment)
+    {
+      char oldPath[32];
+      segmentPath(oldPath, sizeof(oldPath), oldestSegment);
+      LittleFS.remove(oldPath);
+      oldestSegment++;
+    }
+    if (LittleFS.totalBytes() - LittleFS.usedBytes() < needed)
+    {
+      // only possible if something else fills the partition; check
+      //  again next time rather than write into a full partition
+      newestSegmentSize = SIZE_MAX;
+      Serial.println("# LOG ERROR - no space left, rows dropped");
+      return;
+    }
   }
   File f = LittleFS.open(path, FILE_APPEND);
   if (!f)
@@ -401,9 +726,8 @@ void flushLog()
     Serial.println("# LOG ERROR - could not open log file");
     return;
   }
-  f.write((const uint8_t *)logBuffer, logLen);
+  newestSegmentSize += f.write((const uint8_t *)rows, len);
   f.close();
-  logLen = 0;
 }
 
 void printLogInfo()
@@ -423,7 +747,9 @@ void printLogInfo()
   Serial.print(LittleFS.usedBytes());
   Serial.print(" / ");
   Serial.print(LittleFS.totalBytes());
-  Serial.println(" bytes used");
+  Serial.print(" bytes used, ");
+  Serial.print(logRowsDropped);
+  Serial.println(" rows dropped (log busy)");
 }
 
 // Serial commands. Dumping blocks sampling while it runs; sampling
@@ -437,7 +763,7 @@ void handleCommand(char c)
       Serial.println("# LOG ERROR - LittleFS mount failed, no log");
       return;
     }
-    flushLog();
+    finishLogWrites();
     Serial.setTxTimeoutMs(100); // dump is requested by a reader, so wait for
                                 //  it rather than drop parts of the file
     Serial.println("# BEGIN " + String(LOG_DIR));
@@ -466,6 +792,7 @@ void handleCommand(char c)
   else if (c == 'e')
   {
     logLen = 0;
+    finishLogWrites(); // a write in progress would recreate its segment
     for (uint32_t segment = oldestSegment; segment <= newestSegment; segment++)
     {
       char path[32];
@@ -473,11 +800,38 @@ void handleCommand(char c)
       LittleFS.remove(path);
     }
     oldestSegment = newestSegment = 1;
+    newestSegmentSize = SIZE_MAX;
     Serial.println("# log erased");
     Serial.print(LOG_HEADER); // header for the live rows
   }
   else if (c == 'i')
   {
     printLogInfo();
+  }
+  else if (c == 's')
+  {
+    groupSamples = 0; // start with a fresh packet
+    packetSamples = 0;
+    packetOverruns = 0;
+    streamMode = true;
+  }
+  else if (c == 'r')
+  {
+    Serial.setTimeout(20); // the digits arrive right after the 'r'
+    long n = Serial.parseInt(); // leaves the '\n', ignored as a command
+    streamDecimation = constrain(n, 1, MAX_STREAM_DECIMATION);
+    groupSamples = 0; // the packet size may change, start a fresh one
+    packetSamples = 0;
+    packetOverruns = 0;
+  }
+  else if (c == 't')
+  {
+    if (streamMode)
+    {
+      streamMode = false;
+      Serial.println();  // end any partial packet bytes in the monitor
+      Serial.println("# text output");
+      Serial.print(LOG_HEADER); // header for the live rows
+    }
   }
 }
