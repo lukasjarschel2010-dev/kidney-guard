@@ -77,11 +77,13 @@ uint32_t bootCount = 0; // distinguishes power cycles, since ms restarts at 0
 //  's' itself when it connects. The live text rows and diagnostics are
 //  not printed then, since they would garble the Serial Monitor view
 //  anyway; the CSV log on flash keeps running as normal.
+// Packets are queued for streamTask on core 0, so loop() never waits on USB
+//  and a short stall or log flush doesn't lose any. If the queue is full
+//  the packet is dropped whole (the host sees the gap in seq).
 // Command 'r<N>' (e.g. "r10\n") streams only one of every N sensor samples,
 //  see streamSample(). The sensor, impact detection and the log keep
 //  running at the full 1 kHz.
-// Packet layout, little-endian. Examples/HLIS331DL_Stream sends the same
-//  without the FSR readings, under sync 0xA5 0x5B:
+// Packet layout, little-endian:
 //  0xA5 0x5C        sync, the second byte names the layout
 //  uint16 seq       increments per packet, so the host can spot drops
 //  uint32 micros    micros() when the packet's last sample was read
@@ -98,8 +100,16 @@ const int SAMPLES_PER_PACKET = 10; // at full rate: 10 ms per packet,
                                    //  100 packets/sec
 const int SAMPLE_BYTES = 3 * 2 + FSR_COUNT * 2;
 const int PACKET_BYTES = 2 + 2 + 4 + 2 + 1 + 1 + SAMPLES_PER_PACKET * SAMPLE_BYTES + 1;
+const int STREAM_QUEUE_PACKETS = 32;    // ~320 ms of slack at full rate
+const int STREAM_STALL_LIMIT_MS = 50;   // host gone if no byte goes out for this
+struct StreamPacket
+{
+  uint16_t len;
+  uint8_t bytes[PACKET_BYTES];
+};
+QueueHandle_t streamQueue; // packets for streamTask to send
 bool streamMode = false;
-uint8_t packet[PACKET_BYTES];
+StreamPacket packet;    // the one being filled
 int packetSamples = 0;  // samples in the packet being filled
 uint8_t packetOverruns = 0;
 uint16_t packetSeq = 0;
@@ -214,6 +224,10 @@ void setup()
                             //  plugged in but no program reading the port,
                             //  prints would otherwise stall the loop for up
                             //  to 100 ms each. Unread output is dropped.
+
+  streamQueue = xQueueCreate(STREAM_QUEUE_PACKETS, sizeof(StreamPacket));
+  // loop() runs on core 1, so USB writes don't hold it up
+  xTaskCreatePinnedToCore(streamTask, "stream", 4096, NULL, 1, NULL, 0);
 }
 
 const unsigned long PRINT_INTERVAL_MS = 100;    // peak window, max 10 prints/sec
@@ -505,13 +519,11 @@ int packetTarget()
   return max(1, SAMPLES_PER_PACKET / streamDecimation);
 }
 
-// Adds a sample to the stream packet and sends the packet when it is full.
-//  A packet that doesn't fit in the USB transmit buffer is dropped whole
-//  (the host sees the gap in seq) rather than sent in part.
+// Adds a sample to the stream packet and queues the packet when it is full.
 void addPacketSample(const int16_t xyz[3], const uint16_t fsr[FSR_COUNT])
 {
   uint32_t sampleMicros = micros();
-  uint8_t *sample = &packet[12 + packetSamples * SAMPLE_BYTES];
+  uint8_t *sample = &packet.bytes[12 + packetSamples * SAMPLE_BYTES];
   memcpy(sample, xyz, 3 * sizeof(int16_t)); // ESP32 is LE
   memcpy(sample + 3 * sizeof(int16_t), fsr, FSR_COUNT * sizeof(uint16_t));
   if (++packetSamples < packetTarget())
@@ -519,28 +531,75 @@ void addPacketSample(const int16_t xyz[3], const uint16_t fsr[FSR_COUNT])
     return;
   }
   int packetBytes = 12 + packetSamples * SAMPLE_BYTES + 1;
-  packet[0] = SYNC0;
-  packet[1] = SYNC1;
-  packet[2] = packetSeq & 0xFF;
-  packet[3] = packetSeq >> 8;
-  memcpy(&packet[4], &sampleMicros, 4);
-  packet[8] = ACCEL_RANGE_G & 0xFF;
-  packet[9] = ACCEL_RANGE_G >> 8;
-  packet[10] = packetSamples;
-  packet[11] = packetOverruns;
+  packet.bytes[0] = SYNC0;
+  packet.bytes[1] = SYNC1;
+  packet.bytes[2] = packetSeq & 0xFF;
+  packet.bytes[3] = packetSeq >> 8;
+  memcpy(&packet.bytes[4], &sampleMicros, 4);
+  packet.bytes[8] = ACCEL_RANGE_G & 0xFF;
+  packet.bytes[9] = ACCEL_RANGE_G >> 8;
+  packet.bytes[10] = packetSamples;
+  packet.bytes[11] = packetOverruns;
   uint8_t sum = 0;
   for (int i = 2; i < packetBytes - 1; i++)
   {
-    sum += packet[i];
+    sum += packet.bytes[i];
   }
-  packet[packetBytes - 1] = sum;
-  if (Serial.availableForWrite() >= packetBytes)
-  {
-    Serial.write(packet, packetBytes);
-  }
+  packet.bytes[packetBytes - 1] = sum;
+  packet.len = packetBytes;
+  xQueueSend(streamQueue, &packet, 0); // full: drop it, seq shows the gap
   packetSeq++;
   packetSamples = 0;
   packetOverruns = 0;
+}
+
+// Core 0: sends each queued packet, which can take several USB writes since
+//  it may be larger than the USB buffer. The packet stays in the queue until
+//  it is sent, so an empty queue means nothing is on its way, which is what
+//  finishStreamWrites() waits for.
+void streamTask(void *)
+{
+  StreamPacket p;
+  for (;;)
+  {
+    xQueuePeek(streamQueue, &p, portMAX_DELAY);
+    size_t sent = 0;
+    int stallMs = 0;
+    while (sent < p.len && stallMs < STREAM_STALL_LIMIT_MS)
+    {
+      size_t n = Serial.write(p.bytes + sent, p.len - sent);
+      sent += n;
+      if (n == 0)
+      {
+        stallMs++;
+        vTaskDelay(pdMS_TO_TICKS(1));
+      }
+      else
+      {
+        stallMs = 0;
+      }
+    }
+    if (sent < p.len)
+    {
+      // Nobody is reading, so drop the backlog rather than send stale
+      //  packets later. A packet cut short here fails its checksum.
+      xQueueReset(streamQueue);
+    }
+    else
+    {
+      xQueueReceive(streamQueue, &p, 0);
+    }
+  }
+}
+
+// Waits until streamTask has sent everything queued, so text printed next
+//  can't land in the middle of a packet.
+void finishStreamWrites()
+{
+  while (uxQueueMessagesWaiting(streamQueue) > 0)
+  {
+    delay(1);
+  }
 }
 
 void segmentPath(char *path, size_t size, uint32_t segment)
@@ -758,6 +817,7 @@ void handleCommand(char c)
 {
   if (c == 'd')
   {
+    finishStreamWrites();
     if (!logReady)
     {
       Serial.println("# LOG ERROR - LittleFS mount failed, no log");
@@ -791,6 +851,7 @@ void handleCommand(char c)
   }
   else if (c == 'e')
   {
+    finishStreamWrites();
     logLen = 0;
     finishLogWrites(); // a write in progress would recreate its segment
     for (uint32_t segment = oldestSegment; segment <= newestSegment; segment++)
@@ -806,6 +867,7 @@ void handleCommand(char c)
   }
   else if (c == 'i')
   {
+    finishStreamWrites();
     printLogInfo();
   }
   else if (c == 's')
@@ -829,6 +891,7 @@ void handleCommand(char c)
     if (streamMode)
     {
       streamMode = false;
+      finishStreamWrites();
       Serial.println();  // end any partial packet bytes in the monitor
       Serial.println("# text output");
       Serial.print(LOG_HEADER); // header for the live rows
