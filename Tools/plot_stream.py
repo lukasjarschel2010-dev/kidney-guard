@@ -9,24 +9,25 @@ at 1 kHz). Each streamed sample is the one with the largest |a| of its
 group, so impact peaks survive, and each FSR is its lowest reading (hardest
 press); the peak's time is only accurate to one streamed sample period, though.
 
-Shows the last few seconds of X/Y/Z and the vector magnitude, with the
-impact threshold drawn in, and the FSRs on D8, D9 and D10 when the sketch
-sends them (kidney_guard does), drawn as conductance, which is roughly
-proportional to force. Optionally records every sample to CSV. Close
-the Arduino Serial Monitor first, only one program can open the port.
+Shows the last few seconds of X/Y/Z, and the FSRs on D8, D9 and D10 when the
+sketch sends them (kidney_guard does), drawn as conductance, which is roughly
+proportional to force, on a fixed axis that gives most of its height to strong
+presses. Optionally records every sample to CSV. Close the
+Arduino Serial Monitor first, only one program can open the port.
 
 Usage:
     python3 Tools/plot_stream.py                  # auto-detect port
     python3 Tools/plot_stream.py -o impact.csv    # also record to CSV
-    python3 Tools/plot_stream.py -p /dev/cu.usbmodem1101 -w 5 -t 50
+    python3 Tools/plot_stream.py -p /dev/cu.usbmodem1101 -w 5
     python3 Tools/plot_stream.py -r 100           # stream 100 samples/sec
 
-X/Y/Z and magnitude are drawn flat at rest: samples within --noise-band of an
+X/Y/Z are drawn flat at rest: samples within --noise-band of an
 axis's resting value draw as that value, and anything further out draws at
-its true raw value, so impact heights are kept. X/Y/Z are then shifted so each
-axis rests at 0, cancelling gravity and the sensor's zero-g offset, and the
-magnitude is taken from those shifted values, so it rests at 0 too. Use
---noise-band 0 for the raw signal. The CSV is always raw.
+its true raw value, so impact heights are kept. They are then shifted so each
+axis rests at 0, cancelling gravity and the sensor's zero-g offset. Use
+--noise-band 0 for the raw signal. Either way X/Y/Z draw as absolute values,
+so the graph shows only positive values, on a fixed log scale that doesn't
+resize. The CSV is always raw.
 
 Keys: space = pause/resume the view (recording continues).
 
@@ -53,9 +54,13 @@ LAYOUTS = {0x5B: 3, 0x5C: 6}
 NOISE_BAND_G = 6.0                 # largest resting noise measured: 5.75 g
 BASELINE_TAU_S = 3.0               # how fast the resting value follows a tilt
 LEVEL_STEP_G = 0.3                 # drawn level moves only for a shift this big
+ACCEL_LOG_MIN_G = 1.0              # bottom of the log axis, rest draws here
+ACCEL_LOG_MAX_G = 300.0            # top: 200 g full scale plus resting offsets
 FSR_COUNT = 3
 FSR_ADC_MAX = 4095                 # the reading at rest
 FSR_PULLUP_KOHM = 4.7
+FSR_MAX_CONDUCTANCE = 1.1          # top of the axis in 1/kohm: the hardest press
+                                   #  recorded, a reading of 663
 FSR_NAMES = ("D8", "D9", "D10")
 # Press bands on the plot, at or below. Set from one held press at each level
 #  (medians 3136, 1645, 771), midway between them in FSR resistance. Plot only:
@@ -298,7 +303,7 @@ class NoiseGate:
         return xyz if self.level is None else xyz - self.level
 
 
-COLUMNS = 5 + FSR_COUNT  # t, x, y, z, magnitude, fsr D8, D9, D10
+COLUMNS = 4 + FSR_COUNT  # t, x, y, z, fsr D8, D9, D10
 
 
 class RingBuffer:
@@ -370,60 +375,12 @@ def fsr_conductance(adc):
     return (FSR_ADC_MAX - adc) / (FSR_PULLUP_KOHM * adc)
 
 
-def nice_step(span):
-    """A 1, 2 or 5 times a power of ten step near span/4."""
-    raw = span / 4
-    base = 10 ** np.floor(np.log10(raw))
-    for m in (1, 2, 5):
-        if m * base >= raw:
-            return m * base
-    return 10 * base
-
-
-class StableYRange:
-    """Sets a plot's y range from its visible data without wobbling.
-
-    The range is rounded out to a nice step, grows as soon as the data
-    leaves it, and shrinks only once it is well over twice what the data
-    needs, so noise doesn't rescale the axis every frame.
-    """
-
-    def __init__(self, plot, min_span, floor=None):
-        self.plot = plot
-        self.min_span = min_span
-        self.floor = floor  # lowest the range starts, e.g. 0 for |a|
-        self.range = None
-        plot.enableAutoRange(y=False)
-
-    def update(self, values):
-        values = values[np.isfinite(values)]
-        if not len(values):
-            return
-        lo, hi = values.min(), values.max()
-        if self.floor is not None:
-            lo = min(lo, self.floor)
-        span = max(hi - lo, self.min_span)
-        if self.range:
-            r_lo, r_hi = self.range
-            if lo >= r_lo and hi <= r_hi and r_hi - r_lo <= 2.5 * span:
-                return
-        step = nice_step(span)
-        r_lo = np.floor(lo / step) * step
-        r_hi = np.ceil(hi / step) * step
-        if r_hi - r_lo < span:
-            r_hi = r_lo + np.ceil(span / step) * step
-        self.range = (r_lo, r_hi)
-        self.plot.setYRange(r_lo, r_hi, padding=0.02)
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("-p", "--port", help="serial port (default: auto-detect)")
     parser.add_argument("-o", "--output", help="record every sample to this CSV")
     parser.add_argument("-w", "--window", type=float, default=10.0,
                         help="seconds of history shown (default: 10)")
-    parser.add_argument("-t", "--threshold", type=float, default=50.0,
-                        help="impact threshold line in g (default: 50)")
     parser.add_argument("-r", "--rate", type=float,
                         default=MAX_SAMPLE_RATE_HZ,
                         help="samples/sec to stream, kidney_guard only "
@@ -455,35 +412,32 @@ def main():
     status = win.addLabel("waiting for data...", row=0, col=0)
 
     axes_plot = win.addPlot(row=1, col=0)
-    axes_plot.setLabel("left", "change from rest" if args.noise_band
-                       else "acceleration", units="g")
+    axes_plot.setLabel("left", "|change from rest|" if args.noise_band
+                       else "|acceleration|", units="g")
     axes_plot.addLegend(offset=(10, 10))
-    mag_plot = win.addPlot(row=2, col=0)
-    mag_plot.setLabel("left", "|a| from rest" if args.noise_band else "|a|",
-                      units="g")
-    mag_plot.setXLink(axes_plot)
-    fsr_plot = win.addPlot(row=3, col=0)
+    fsr_plot = win.addPlot(row=2, col=0)
     fsr_plot.setLabel("left", "FSR")
     fsr_plot.setLabel("bottom", "time", units="s")
     fsr_plot.setXLink(axes_plot)
-    for plot in (axes_plot, mag_plot, fsr_plot):
+    for row in (1, 2):  # same height; stretch factors have no effect here
+        win.ci.layout.setRowPreferredHeight(row, 1000)
+    for plot in (axes_plot, fsr_plot):
         plot.showGrid(x=True, y=True, alpha=0.3)
         plot.getAxis("left").setWidth(80)  # keeps the time axes lined up
         # Downsampling is done by peak_decimate(), pyqtgraph's own shimmers
         #  while scrolling
-    y_ranges = (StableYRange(axes_plot, min_span=1.0),
-                StableYRange(mag_plot, min_span=1.0, floor=0.0),
-                StableYRange(fsr_plot, min_span=1.5, floor=0.0))
+    axes_plot.setLogMode(False, True)
+    # The range of a log axis is given as log10 of the values
+    axes_plot.setYRange(np.log10(ACCEL_LOG_MIN_G), np.log10(ACCEL_LOG_MAX_G),
+                        padding=0.02)
+    axes_plot.getAxis("left").setTicks([[
+        (np.log10(g), str(g)) for g in (1, 2, 5, 10, 20, 50, 100, 200)]])
+    fsr_plot.setYRange(0, FSR_MAX_CONDUCTANCE, padding=0.02)
 
     curves = [axes_plot.plot(pen=pg.mkPen(color, width=1), name=name,
                              connect="finite")
               for name, color in (("x", "#e5534b"), ("y", "#57ab5a"),
                                   ("z", "#539bf5"))]
-    curves.append(mag_plot.plot(pen=pg.mkPen("#c69026", width=1),
-                                connect="finite"))
-    mag_plot.addItem(pg.InfiniteLine(
-        pos=args.threshold, angle=0, pen=pg.mkPen("#888", style=QtCore.Qt.PenStyle.DashLine),
-        label=f"{args.threshold:g} g", labelOpts={"position": 0.02}))
     curves += [fsr_plot.plot(pen=pg.mkPen(color, width=1), connect="finite")
                for color in ("#986ee2", "#cc6b2c", "#39c5cf")]
     medium = fsr_conductance(FSR_MEDIUM_ADC)
@@ -496,7 +450,7 @@ def main():
     fsr_plot.getAxis("left").setTicks([[
         (medium / 2, "light"),
         ((medium + heavy) / 2, "medium"),
-        (heavy + (heavy - medium), "strong")]])
+        ((heavy + FSR_MAX_CONDUCTANCE) / 2, "strong")]])
     fsr_plot.showGrid(x=True, y=False)  # the band lines replace the y grid
 
     ring = RingBuffer(int(args.window * MAX_SAMPLE_RATE_HZ))
@@ -520,9 +474,10 @@ def main():
                 gate.reset()
             if gap:  # a NaN row breaks the line across dropped packets
                 ring.extend(np.full((1, COLUMNS), np.nan))
-            xyz = gate.zero(gate.apply(xyz))
-            mag = np.linalg.norm(xyz, axis=1)
-            ring.extend(np.column_stack((t, xyz, mag, fsr_conductance(fsr))))
+            # Clipped to the axis bottom, a log axis can't draw 0
+            xyz = np.maximum(np.abs(gate.zero(gate.apply(xyz))),
+                             ACCEL_LOG_MIN_G)
+            ring.extend(np.column_stack((t, xyz, fsr_conductance(fsr))))
 
         now = time.monotonic()
         if now - state["last_time"] >= 1.0:
@@ -569,10 +524,6 @@ def main():
         for i, curve in enumerate(curves):
             curve.setData(data[:, 0], data[:, i + 1])
         axes_plot.setXRange(t_start, t_end, padding=0)
-        in_view = data[:, 0] <= t_end
-        y_ranges[0].update(data[in_view, 1:4])
-        y_ranges[1].update(data[in_view, 4])
-        y_ranges[2].update(data[in_view, 5:8])
 
     timer = QtCore.QTimer()
     timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
