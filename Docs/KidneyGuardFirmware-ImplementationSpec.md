@@ -126,7 +126,7 @@ Then apply the geometric-mean formula above.
 
 ## 4. Accelerometer Wiring and Configuration
 
-The H3LIS331DL runs at ±200 g and 1000 Hz on I2C address 0x19, with Block Data Update on. INT1 is latched high when any axis exceeds 100 g.
+The H3LIS331DL runs at ±200 g and 1000 Hz on I2C address 0x19, with Block Data Update on. INT1 is latched high when any axis exceeds 100 g (`IMPACT_THRESHOLD_G`). The sensor checks every sample itself, so INT1 also catches impacts in samples that were never read, for example during a flash write. The latch survives an MCU reset, so `setup()` clears it.
 
 **Wiring**
 
@@ -144,7 +144,7 @@ The firmware talks to the host over the ESP32-S3's native USB CDC port at 115200
 
 ## 6. Firmware Architecture
 
-All sampling happens in `loop()` on core 1. The two slow writers, flash and USB, run as FreeRTOS tasks on core 0 and are fed through queues, so a write never holds up a sample.
+All sampling happens in `loop()` on core 1. The two slow writers, flash and USB, run as FreeRTOS tasks on core 0 and are fed through queues, so a slow write doesn't hold up sampling. The exception is that the ESP32 pauses both cores for each flash erase or program, so a flush can still cost some samples.
 
 Every sample feeds two independent paths:
 
@@ -152,3 +152,25 @@ Every sample feeds two independent paths:
 - **Event recording** (green): always runs, and keeps a lasting record on flash of each 100 ms window with a strong impact or hard squeeze.
 
 ![Firmware data flow: core 1 sampling, core 0 writers](images/firmware-architecture.svg)
+
+**When a row is logged**
+
+A 100 ms window makes one row if any of these is true:
+
+- A sample reached 100 g on any axis (`IMPACT_THRESHOLD_G`)
+- INT1 fired during the window
+- The lowest reading of any FSR is 2030 counts or below (`FSR_HEAVY_ADC`)
+
+**Row format**
+
+| Column | Meaning |
+| --- | --- |
+| `boot` | Boot count, since `ms` restarts at 0 |
+| `ms` | `millis()` at the end of the window |
+| `x_g`, `y_g`, `z_g` | The sample with the largest combined acceleration |
+| `combined_g` | That sample's combined acceleration |
+| `peak_axis_g`, `peak_axis` | The largest single-axis reading, with its sign, and its axis |
+| `fsr_d8_adc`, `fsr_d9_adc`, `fsr_d10_adc` | Lowest reading of each FSR, in raw counts |
+| `missed_peak` | 1 if INT1 fired but no sample read in the window reached 100 g, so the row's peak values are too low |
+
+Rows from older firmware have a different format, so erase the log after updating from one.
