@@ -3,3 +3,4 @@ kidney_log.csv
 Logs/
 
 __pycache__/
+.venv/
