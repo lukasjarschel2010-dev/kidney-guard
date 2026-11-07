@@ -9,7 +9,7 @@ The Kidney Guard firmware samples a ±200 g accelerometer at 1 kHz and reads thr
 The firmware provides:
 
 - 1 kHz three-axis acceleration from an H3LIS331DL over 400 kHz I2C
-- Impact counting from the accelerometer's latched threshold interrupt (INT1)
+- Impact counting and logging from the accelerometer's latched threshold interrupt (INT1), which also catches impacts in samples that were never read
 - Three FSR readings on the ESP32-S3's 12-bit ADC, taken with each accelerometer sample
 - A CSV event row for each 100 ms window that crosses an impact or squeeze threshold, printed and kept in a ring log on flash
 - A binary stream of every sample, optionally decimated, for a host program
@@ -70,15 +70,15 @@ The pin voltage is V = 3.3 V × R\_FSR ÷ (R\_FSR + 4.7 kΩ). With no pressure t
 - `FSR_PINS = {A8, A9, A10}`, each set as `INPUT` in `setup()`. No internal pull-up or pull-down is used.
 - `analogRead()` returns 0–4095 with the default ADC settings (`FSR_ADC_MAX` = 4095).
 - All three FSRs are read right after each accelerometer sample, so they are sampled at 1 kHz.
-- Voltage for the log: `fsr_v` = count × 3.3 ÷ 4095.
+- The log stores raw counts: `fsr_d8_adc`, `fsr_d9_adc` and `fsr_d10_adc`. Voltage = count × 3.3 ÷ 4095.
 
 **How each FSR is used**
 
 | FSR | Event log | Squeeze check | Stream |
 | --- | --- | --- | --- |
 | FSR 1 (D8) | Lowest reading of each 100 ms window | Row made at ≤ 2030 counts (`FSR_HEAVY_ADC`, "Heavy Squeeze") | Yes |
-| FSR 2 (D9) | — | — | Yes |
-| FSR 3 (D10) | — | — | Yes |
+| FSR 2 (D9) | Lowest reading of each 100 ms window | Row made at ≤ 2030 counts (`FSR_HEAVY_ADC`, "Heavy Squeeze") | Yes |
+| FSR 3 (D10) | Lowest reading of each 100 ms window | Row made at ≤ 2030 counts (`FSR_HEAVY_ADC`, "Heavy Squeeze") | Yes |
 
 In the stream, each FSR sends its lowest reading of every decimation group, so a short press survives decimation. 2030 counts is about 1.64 V, an FSR resistance of about 4.6 kΩ.
 
@@ -126,7 +126,7 @@ Then apply the geometric-mean formula above.
 
 ## 4. Accelerometer Wiring and Configuration
 
-The H3LIS331DL runs at ±200 g and 1000 Hz on I2C address 0x19, with Block Data Update on. INT1 is latched high when any axis exceeds 50 g.
+The H3LIS331DL runs at ±200 g and 1000 Hz on I2C address 0x19, with Block Data Update on. INT1 is latched high when any axis exceeds 100 g.
 
 **Wiring**
 

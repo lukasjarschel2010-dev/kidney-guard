@@ -18,10 +18,15 @@ const uint8_t INT1_SRC_ADDR = 0x31; // reading it clears the latched INT1
 
 const int ACCEL_RANGE_G = 200;      // must match setFullScale()
 
+// A log row is written for a window with an axis at or over this, seen either
+//  in a sample or on INT1.
+const float IMPACT_THRESHOLD_G = 100.0;
+
 // Accelerometer INT1 is wired to D0. It goes high when |x|, |y| or |z| exceeds
-//  INT_THRESHOLD_G and stays high (latched) until INT1_SRC is read.
+//  IMPACT_THRESHOLD_G and stays high (latched) until INT1_SRC is read. The
+//  sensor checks every sample itself, so this also catches impacts in samples
+//  that were never read, e.g. while a flash write paused both cores.
 const int INT1_PIN = D0;
-const float INT_THRESHOLD_G = 50.0;
 // While an axis stays over threshold INT1 fires again on every sample, so
 //  an impact only counts as over once INT1 has been quiet for this long.
 const unsigned long IMPACT_REARM_MS = 20;
@@ -29,7 +34,7 @@ const unsigned long IMPACT_REARM_MS = 20;
 // FSR voltage dividers on D8, D9, D10 (GPIO7-9, analog A8-A10), each with
 //  a 4.7k pull-up to 3.3V and the FSR to GND, so a reading is ~4095 at rest
 //  and falls as the FSR is pressed. All three are streamed; the log and the
-//  "Heavy Squeeze" check use the first one (D8).
+//  "Heavy Squeeze" check use all three too.
 const int FSR_COUNT = 3;
 const int FSR_ADC_MAX = 4095; // 12-bit ADC, also the reading at rest
 const int FSR_PINS[FSR_COUNT] = {A8, A9, A10};
@@ -48,9 +53,10 @@ const int FSR_PINS[FSR_COUNT] = {A8, A9, A10};
 const char *LOG_DIR = "/log";
 const char *LEGACY_LOG_PATH = "/log.csv";      // single-file log, pre ring buffer
 const char *LOG_HEADER =
-  "boot,ms,x_g,y_g,z_g,combined_g,peak_axis_g,peak_axis,fsr_adc,fsr_v\n";
+  "boot,ms,x_g,y_g,z_g,combined_g,peak_axis_g,peak_axis,"
+  "fsr_d8_adc,fsr_d9_adc,fsr_d10_adc,missed_peak\n";
 const size_t LOG_BUFFER_SIZE = 4096;
-const size_t LOG_SEGMENT_SIZE = 65536;         // ~1500 rows, ~4% of the log
+const size_t LOG_SEGMENT_SIZE = 65536;         // ~1100 rows, ~4% of the log
 const unsigned long LOG_FLUSH_QUIET_MS = 1000; // flush after 1 s w/o events
 const size_t LOG_FREE_MARGIN = 8192;           // keep 2 flash blocks spare
 char logBuffers[2][LOG_BUFFER_SIZE];
@@ -140,14 +146,14 @@ void setup()
                           //  Also zeroes out all accelerometer
                           //  registers that are user writable.
   // New samples are detected by polling STATUS_REG (ZYXDA). INT1 is only
-  //  used as a threshold event counter, see below.
+  //  used to count impacts and log them, see below.
   xl.setFullScale(LIS331::MED_RANGE); // +/-200g
   xl.setODR(LIS331::DR_1000HZ); // Accelerometer output data rate: 1000 Hz
   enableBlockDataUpdate(); // MUST be called AFTER setFullScale(), which
                           //  clears bit 7 of CTRL_REG4
   // This next section configures an interrupt. It will cause pin
   //  INT1 on the accelerometer to go high when the absolute value
-  //  of the reading on any axis exceeds INT_THRESHOLD_G.
+  //  of the reading on any axis exceeds IMPACT_THRESHOLD_G.
   xl.intSrcConfig(LIS331::INT_SRC, 1); // Select the source of the
                           //  signal which appears on pin INT1. In
                           //  this case, we want the corresponding
@@ -160,7 +166,7 @@ void setup()
   // Threshold register is 7 bits, compared against counts/16. At
   //  +/-200g one register LSB is 16 * 200/2047 = ~1.56g.
   const float gPerThsLsb = 16.0 * ACCEL_RANGE_G / 2047;
-  int ths = (int)(INT_THRESHOLD_G / gPerThsLsb + 0.5);
+  int ths = (int)(IMPACT_THRESHOLD_G / gPerThsLsb + 0.5);
   if (ths > 127) ths = 127;
   xl.setIntThreshold(ths, 1);
   // INT1_CFG's AOI bit is left at 0 (by begin()), so the axes are
@@ -221,6 +227,11 @@ void setup()
     Serial.println("# I2C ERROR - could not read CTRL_REG4");
   }
 
+  // Clear INT1 if it latched before this boot, the sensor keeps it through
+  //  an MCU reset, so it doesn't log a row for an impact long past
+  uint8_t staleIntSource;
+  readRegister(INT1_SRC_ADDR, staleIntSource);
+
   Serial.flush();           // let the startup messages above go out first
   Serial.setTxTimeoutMs(0); // Never block on Serial from here on: with USB
                             //  plugged in but no program reading the port,
@@ -235,8 +246,7 @@ void setup()
 const unsigned long PRINT_INTERVAL_MS = 100;    // peak window, max 10 prints/sec
 const unsigned long DIAG_INTERVAL_MS = 1000;    // diagnostics, 1 print/sec
 
-// A window's peak is only printed if one of these thresholds is reached
-const float ACCEL_PRINT_THRESHOLD_G = 100.0; // any single axis
+// A window's peak is only printed if IMPACT_THRESHOLD_G or this is reached
 const int FSR_HEAVY_ADC = 2030;              // "Heavy Squeeze", at or below
 
 void loop()
@@ -249,7 +259,9 @@ void loop()
   static float maxAxisG = 0;            // largest |x|, |y| or |z| in window
   static float peakAxisG = 0;           // that reading with its sign
   static char peakAxis = 'x';           // axis it was measured on
-  static int minFsrAdc = FSR_ADC_MAX;    // lowest reading = hardest press
+  static bool int1Fired = false;        // INT1 was high during the window
+  static int minFsrAdc[FSR_COUNT] = {FSR_ADC_MAX, FSR_ADC_MAX, FSR_ADC_MAX};
+                                        // lowest reading = hardest press
   static unsigned int pollCount = 0;    // STATUS_REG polls since diagnostics
   static unsigned int newDataCount = 0; // new sensor samples processed
   static unsigned int overrunCount = 0; // polls where a sample was missed
@@ -270,6 +282,7 @@ void loop()
       intEventCount++; // first INT1 of a new impact
       inImpact = true;
     }
+    int1Fired = true;
     lastIntMs = millis();
   }
   else if (inImpact && millis() - lastIntMs >= IMPACT_REARM_MS)
@@ -345,23 +358,33 @@ void loop()
       peakAxis = axis;
     }
 
-    if (fsr[0] < minFsrAdc)
+    for (int i = 0; i < FSR_COUNT; i++)
     {
-      minFsrAdc = fsr[0];
+      if (fsr[i] < minFsrAdc[i])
+      {
+        minFsrAdc[i] = fsr[i];
+      }
     }
   }
 
   if (millis() - printTimer >= PRINT_INTERVAL_MS)
   {
     printTimer = millis();
-    if (maxAxisG >= ACCEL_PRINT_THRESHOLD_G || minFsrAdc <= FSR_HEAVY_ADC)
+    bool heavySqueeze = false;
+    for (int i = 0; i < FSR_COUNT; i++)
     {
+      heavySqueeze = heavySqueeze || minFsrAdc[i] <= FSR_HEAVY_ADC;
+    }
+    if (maxAxisG >= IMPACT_THRESHOLD_G || int1Fired || heavySqueeze)
+    {
+      // INT1 saw an impact but no sample did, so the row's peak is too low
+      bool missedPeak = int1Fired && maxAxisG < IMPACT_THRESHOLD_G;
       char row[160];
       int len = snprintf(row, sizeof(row),
-        "%lu,%lu,%.2f,%.2f,%.2f,%.2f,%.2f,%c,%d,%.2f\n",
+        "%lu,%lu,%.2f,%.2f,%.2f,%.2f,%.2f,%c,%d,%d,%d,%d\n",
         (unsigned long)bootCount, printTimer, maxGx, maxGy, maxGz,
-        maxCombined, peakAxisG, peakAxis, minFsrAdc,
-        (minFsrAdc * 3.3) / FSR_ADC_MAX); // ESP32-S3 logic is 3.3V
+        maxCombined, peakAxisG, peakAxis,
+        minFsrAdc[0], minFsrAdc[1], minFsrAdc[2], missedPeak ? 1 : 0);
       len = min(len, (int)sizeof(row) - 1); // snprintf returns untruncated length
       if (!streamMode)
       {
@@ -375,7 +398,11 @@ void loop()
     maxAxisG = 0;
     peakAxisG = 0;
     peakAxis = 'x';
-    minFsrAdc = FSR_ADC_MAX;
+    for (int i = 0; i < FSR_COUNT; i++)
+    {
+      minFsrAdc[i] = FSR_ADC_MAX;
+    }
+    int1Fired = false;
   }
 
   if (millis() - diagTimer >= DIAG_INTERVAL_MS)
