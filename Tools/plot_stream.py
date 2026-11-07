@@ -29,9 +29,15 @@ axis rests at 0, cancelling gravity and the sensor's zero-g offset. Use
 so the graph shows only positive values, on a fixed log scale that doesn't
 resize. The CSV is always raw.
 
+Since the sign is lost that way, the largest negative swing of each impact
+on each axis is labelled "neg" in the axis's color.
+An impact is a run of samples at least --label-min g from rest (after the
+noise band) that ends once the axis stays under it for PEAK_REARM_S. Use
+--label-min 0 to turn the labels off.
+
 Keys: space = pause/resume the view (recording continues).
 
-Requires:  python3 -m pip install pyserial numpy pyqtgraph PyQt6
+Requires:  python3 -m pip install -r Tools/requirements.txt
 """
 import argparse
 import collections
@@ -56,6 +62,11 @@ BASELINE_TAU_S = 3.0               # how fast the resting value follows a tilt
 LEVEL_STEP_G = 0.3                 # drawn level moves only for a shift this big
 ACCEL_LOG_MIN_G = 1.0              # bottom of the log axis, rest draws here
 ACCEL_LOG_MAX_G = 300.0            # top: 200 g full scale plus resting offsets
+PEAK_LABEL_MIN_G = 20.0            # label negative peaks at least this far out
+PEAK_REARM_S = 0.02                # an impact ends after this long under it,
+                                   #  like IMPACT_REARM_MS in the sketch
+AXIS_NAMES = ("x", "y", "z")
+AXIS_COLORS = ("#e5534b", "#57ab5a", "#539bf5")
 FSR_COUNT = 3
 FSR_ADC_MAX = 4095                 # the reading at rest
 FSR_PULLUP_KOHM = 4.7
@@ -303,6 +314,59 @@ class NoiseGate:
         return xyz if self.level is None else xyz - self.level
 
 
+class NegativePeaks:
+    """Finds the largest negative swing of each impact, per axis.
+
+    feed() takes signed samples relative to rest and returns (t, axis, g)
+    for each impact that ended with a swing of at least min_g below rest.
+    An impact is a run of samples at least min_g from rest, either sign,
+    that ends once the axis has stayed under min_g for rearm_s, so the
+    ringing after a hit gets one label rather than one per oscillation.
+    """
+
+    def __init__(self, min_g, rearm_s):
+        self.min_g = min_g
+        self.rearm_s = rearm_s
+        self.reset()
+
+    def reset(self):
+        self.last_over = [None] * 3  # time of the impact's latest sample over
+        self.peak = [None] * 3       # (t, g) of its most negative one so far
+
+    def feed(self, t, signed):
+        found = []
+        if not self.min_g:
+            return found
+        over = np.abs(signed) >= self.min_g
+        for axis in range(3):
+            if self.last_over[axis] is None and not over[:, axis].any():
+                continue  # quiet, the common case
+            for i in range(len(t)):
+                if over[i, axis]:
+                    self.last_over[axis] = t[i]
+                    g = signed[i, axis]
+                    if g < 0 and (self.peak[axis] is None
+                                  or g < self.peak[axis][1]):
+                        self.peak[axis] = (t[i], g)
+                elif (self.last_over[axis] is not None
+                      and t[i] - self.last_over[axis] >= self.rearm_s):
+                    found += self._end(axis)
+        return found
+
+    def flush(self):
+        """Ends every impact in progress, e.g. at a gap in the stream."""
+        found = []
+        for axis in range(3):
+            found += self._end(axis)
+        return found
+
+    def _end(self, axis):
+        peak = self.peak[axis]
+        self.last_over[axis] = None
+        self.peak[axis] = None
+        return [] if peak is None else [(peak[0], axis, peak[1])]
+
+
 COLUMNS = 4 + FSR_COUNT  # t, x, y, z, fsr D8, D9, D10
 
 
@@ -365,6 +429,64 @@ def peak_decimate(rows, first_index, ds):
     return np.concatenate((out, rows[n:]))  # newest partial group as is
 
 
+def smooth_span(window_s, pixels, refresh_hz):
+    """Seconds to show near window_s, so the view scrolls evenly.
+
+    Lines are drawn on whole pixels, so a speed of 2.46 pixels per display
+    refresh moves the picture 2, 2, 3, 2, 3... pixels, which looks jittery.
+    The span is adjusted so the speed is a whole number of pixels per
+    refresh, or below one, one pixel every whole number of refreshes.
+    That shows between 0.67 and 1.5 times window_s.
+    """
+    if pixels < 1 or refresh_hz <= 0:
+        return window_s
+    speed = pixels / window_s / refresh_hz  # pixels per refresh
+    if speed >= 1:
+        speed = round(speed)
+    else:
+        speed = 1 / round(1 / speed)
+    return pixels / (speed * refresh_hz)
+
+
+class PixelScroll:
+    """Steps the view the same whole number of pixels every refresh.
+
+    Rounding the clock-based position to a pixel each frame isn't enough:
+    the time a frame runs varies by a fraction of a millisecond, and near
+    a rounding boundary that turns a 2 px step into 1 px or 3 px. Instead
+    the position moves by refreshes elapsed times the speed, and is only
+    nudged by one pixel when it drifts more than 1.5 pixels from the clock.
+    """
+
+    def __init__(self):
+        self.grid = None  # (pixels, span) the position was set up for
+        self.px = None    # position of the view's right edge, in pixels
+        self.last = None  # time of the previous frame
+
+    def position(self, t_end, now, pixels, span, refresh_hz):
+        """Right edge of the view: t_end moved onto the pixel grid."""
+        if pixels < 1 or refresh_hz <= 0:
+            self.grid = None
+            return t_end
+        s_per_px = span / pixels
+        target = t_end / s_per_px
+        speed = pixels / (span * refresh_hz)  # pixels per refresh
+        if self.grid != (pixels, span):
+            self.px = target  # first frame, resized or new refresh rate
+        else:
+            refreshes = max(1, round((now - self.last) * refresh_hz))
+            self.px += refreshes * speed
+            error = target - self.px
+            if abs(error) > max(8, 4 * speed):
+                self.px = target  # a pause, a gap or the board restarted
+            elif abs(error) > 1.5:  # past timing noise: drift, catch up
+                self.px += 1 if error > 0 else -1
+        self.grid = (pixels, span)
+        self.last = now
+        # 1e-6: k * 0.5 summed up may land just under the whole pixel
+        return np.floor(self.px + 1e-6) * s_per_px
+
+
 def fsr_conductance(adc):
     """FSR conductance in 1/kohm from its reading, 0 at rest.
 
@@ -380,7 +502,9 @@ def main():
     parser.add_argument("-p", "--port", help="serial port (default: auto-detect)")
     parser.add_argument("-o", "--output", help="record every sample to this CSV")
     parser.add_argument("-w", "--window", type=float, default=10.0,
-                        help="seconds of history shown (default: 10)")
+                        help="seconds of history shown, adjusted so the "
+                             "view scrolls a whole number of pixels per "
+                             "display refresh (default: 10)")
     parser.add_argument("-r", "--rate", type=float,
                         default=MAX_SAMPLE_RATE_HZ,
                         help="samples/sec to stream, kidney_guard only "
@@ -389,11 +513,17 @@ def main():
                         help="draw samples within this many g of the resting "
                              "value as flat, 0 shows the raw signal "
                              f"(default: {NOISE_BAND_G:g})")
+    parser.add_argument("--label-min", type=float, default=PEAK_LABEL_MIN_G,
+                        help="label negative peaks at least this many g from "
+                             "rest, 0 turns the labels off "
+                             f"(default: {PEAK_LABEL_MIN_G:g})")
     args = parser.parse_args()
     if not 1 <= args.rate <= MAX_SAMPLE_RATE_HZ:
         parser.error(f"--rate must be 1 to {MAX_SAMPLE_RATE_HZ}")
     if args.noise_band < 0:
         parser.error("--noise-band can't be negative")
+    if args.label_min < 0:
+        parser.error("--label-min can't be negative")
     # The board streams one of every N samples, so the rate is rounded to
     #  1000/N: -r 300 gives 333 samples/sec
     decimation = round(MAX_SAMPLE_RATE_HZ / args.rate)
@@ -407,7 +537,18 @@ def main():
     reader.start()
 
     app = pg.mkQApp("Accelerometer stream")
-    win = pg.GraphicsLayoutWidget(title=f"Accelerometer stream: {port}")
+
+    class PlotWindow(pg.GraphicsLayoutWidget):
+        """Adds up the time spent painting, for FrameClock."""
+
+        paint_s = 0.0
+
+        def paintEvent(self, event):
+            start = time.monotonic()
+            super().paintEvent(event)
+            self.paint_s += time.monotonic() - start
+
+    win = PlotWindow(title=f"Accelerometer stream: {port}")
     win.resize(1100, 900)
     status = win.addLabel("waiting for data...", row=0, col=0)
 
@@ -423,6 +564,10 @@ def main():
         win.ci.layout.setRowPreferredHeight(row, 1000)
     for plot in (axes_plot, fsr_plot):
         plot.showGrid(x=True, y=True, alpha=0.3)
+        # Time grid lines on the major ticks only. The minor ones added ~90
+        #  full-height lines per graph, redrawn every frame as the view
+        #  scrolls: ~11 ms per frame full screen, more than a 100 Hz refresh
+        plot.getAxis("bottom").setStyle(maxTickLevel=0)
         plot.getAxis("left").setWidth(80)  # keeps the time axes lined up
         # Downsampling is done by peak_decimate(), pyqtgraph's own shimmers
         #  while scrolling
@@ -436,8 +581,7 @@ def main():
 
     curves = [axes_plot.plot(pen=pg.mkPen(color, width=1), name=name,
                              connect="finite")
-              for name, color in (("x", "#e5534b"), ("y", "#57ab5a"),
-                                  ("z", "#539bf5"))]
+              for name, color in zip(AXIS_NAMES, AXIS_COLORS)]
     curves += [fsr_plot.plot(pen=pg.mkPen(color, width=1), connect="finite")
                for color in ("#986ee2", "#cc6b2c", "#39c5cf")]
     medium = fsr_conductance(FSR_MEDIUM_ADC)
@@ -453,10 +597,72 @@ def main():
         ((heavy + FSR_MAX_CONDUCTANCE) / 2, "strong")]])
     fsr_plot.showGrid(x=True, y=False)  # the band lines replace the y grid
 
-    ring = RingBuffer(int(args.window * MAX_SAMPLE_RATE_HZ))
+    # smooth_span() shows up to 1.5 times --window
+    ring = RingBuffer(int(2 * args.window * MAX_SAMPLE_RATE_HZ))
     gate = NoiseGate(args.noise_band, MAX_SAMPLE_RATE_HZ / decimation)
+    negatives = NegativePeaks(args.label_min, PEAK_REARM_S)
+
+    class PeakLabels(pg.GraphicsObject):
+        """All negative-peak labels, drawn by one item in screen pixels.
+
+        One pg.TextItem per label re-laid out its text and transform on
+        every frame while the view scrolled, which with a few dozen labels
+        pushed a full-screen frame past a 100 Hz refresh. This item sits
+        on the ViewBox itself rather than on the scrolling data, so its
+        bounds only change on a resize, not on every frame.
+        """
+
+        def __init__(self, vb):
+            super().__init__(vb)
+            self.vb = vb
+            self.labels = collections.deque()  # (t, y, text, color)
+            self.setZValue(10)  # above the curves
+            vb.sigResized.connect(lambda _: self.prepareGeometryChange())
+
+        def add(self, t, y, text, color):
+            self.labels.append((t, y, text, QtGui.QColor(color)))
+            self.update()
+
+        def drop(self, before=None):
+            """Drops labels older than before, or all of them."""
+            while self.labels and (before is None
+                                   or self.labels[0][0] < before):
+                self.labels.popleft()
+            self.update()
+
+        def boundingRect(self):
+            return self.vb.boundingRect()  # the plot area, in pixels
+
+        def paint(self, p, *args):
+            p.setClipRect(self.boundingRect())
+            to_pixels = self.vb.childTransform()  # data -> plot area
+            metrics = p.fontMetrics()
+            for t, y, text, color in self.labels:
+                pos = to_pixels.map(QtCore.QPointF(t, y))
+                width = metrics.horizontalAdvance(text)
+                p.setPen(color)
+                # Centred just above the peak
+                p.drawText(QtCore.QPointF(pos.x() - width / 2,
+                                          pos.y() - metrics.descent() - 2),
+                           text)
+
+    labels = PeakLabels(axes_plot.vb)
+
+    def add_labels(peaks):
+        for t, axis, g in peaks:
+            # Items on a log axis are placed by log10 of the value
+            labels.add(t, np.log10(max(abs(g), ACCEL_LOG_MIN_G)),
+                       "neg",
+                       AXIS_COLORS[axis])
+
+    def clear_labels(before=None):
+        if labels.labels and (before is None
+                              or labels.labels[0][0] < before):
+            labels.drop(before)
+
     state = {"paused": False, "last_samples": 0, "last_time": time.monotonic(),
-             "rate": 0.0}
+             "rate": 0.0, "span": args.window, "status": ""}
+    scroll = PixelScroll()
 
     def toggle_pause():
         state["paused"] = not state["paused"]
@@ -466,17 +672,21 @@ def main():
     def update():
         if reader.error:
             status.setText(f"serial error: {reader.error}")
-            timer.stop()
+            frames.stop()
             return
         for t, xyz, fsr, gap, reset in reader.take_chunks():
             if reset:
                 ring.clear()
                 gate.reset()
+                negatives.reset()
+                clear_labels()
             if gap:  # a NaN row breaks the line across dropped packets
                 ring.extend(np.full((1, COLUMNS), np.nan))
+                add_labels(negatives.flush())
+            signed = gate.zero(gate.apply(xyz))
+            add_labels(negatives.feed(t, signed))
             # Clipped to the axis bottom, a log axis can't draw 0
-            xyz = np.maximum(np.abs(gate.zero(gate.apply(xyz))),
-                             ACCEL_LOG_MIN_G)
+            xyz = np.maximum(np.abs(signed), ACCEL_LOG_MIN_G)
             ring.extend(np.column_stack((t, xyz, fsr_conductance(fsr))))
 
         now = time.monotonic()
@@ -490,11 +700,15 @@ def main():
         paused = "  PAUSED (space)" if state["paused"] else ""
         gated = (f"  noise band: {args.noise_band:g} g"
                  if args.noise_band else "")
-        status.setText(
-            f"{state['rate']:.0f} samples/s  dropped packets: "
+        text = (
+            f"{state['rate']:.0f} samples/s  showing {state['span']:.1f} s  "
+            f"{frames.fps():.0f} fps  dropped packets: "
             f"{reader.dropped_packets}  sensor overruns: {reader.overruns}  "
             f"bad packets: {reader.parser.bad_packets}{gated}{recording}"
             f"{paused}")
+        if text != state["status"]:  # setText() lays the label out again
+            status.setText(text)
+            state["status"] = text
 
         if state["paused"]:
             return
@@ -503,12 +717,19 @@ def main():
             return
         # Scroll with the host clock, mapped to board time, so the view
         #  moves smoothly between packets instead of jumping with each one
-        t_end = (time.monotonic() - reader.offset
-                 - max(VIEW_DELAY_S, reader.packet_s))
-        t_start = t_end - args.window
-        # Only the shown --window seconds (plus one sample, so the line
-        #  enters from the left edge); the buffer holds more when streaming
-        #  below the full rate
+        now = time.monotonic()
+        t_end = now - reader.offset - max(VIEW_DELAY_S, reader.packet_s)
+        pixels = axes_plot.vb.width() * win.devicePixelRatioF()
+        screen = win.windowHandle().screen()
+        refresh_hz = screen.refreshRate() if screen else 0
+        span = smooth_span(args.window, pixels, refresh_hz)
+        state["span"] = span
+        t_end = scroll.position(t_end, now, pixels, span, refresh_hz)
+        t_start = t_end - span
+        clear_labels(before=t_start)  # scrolled out of view
+        # Only the shown seconds (plus one sample, so the line enters from
+        #  the left edge); the buffer holds more when streaming below the
+        #  full rate
         visible = data[:, 0] >= t_start
         if not visible.any():
             return
@@ -517,20 +738,121 @@ def main():
         first_index += start
         # About one group per screen pixel; a power of two, so it only
         #  changes when the window is resized a lot
-        pixels = axes_plot.vb.width() * win.devicePixelRatioF()
-        per_pixel = args.window * MAX_SAMPLE_RATE_HZ / decimation / pixels
+        per_pixel = span * MAX_SAMPLE_RATE_HZ / decimation / max(pixels, 1)
         ds = 2 ** int(np.log2(per_pixel)) if per_pixel >= 2 else 1
         data = peak_decimate(data, first_index, ds)
         for i, curve in enumerate(curves):
             curve.setData(data[:, 0], data[:, i + 1])
         axes_plot.setXRange(t_start, t_end, padding=0)
 
-    timer = QtCore.QTimer()
-    timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
-    timer.timeout.connect(update)
-    timer.start(16)  # ~60 fps, smooth scrolling
+    class FrameClock(QtCore.QObject):
+        """Calls update() once per display refresh, just before painting.
+
+        A fixed timer beats against the display: at 16 ms on a 100 Hz
+        screen each frame stayed up for one or two refreshes, so the
+        scrolling stuttered. requestUpdate() is paced by the display
+        (CVDisplayLink on macOS), and the UpdateRequest it sends is also
+        what paints the window, so the data set here is drawn right away.
+
+        When frames take longer than a refresh (full screen with dense
+        impacts) they would again stay up for one or two refreshes, so it
+        then draws on every second refresh only: an even 50 fps at 100 Hz
+        looks smoother than a mix of 100 and 50. Refreshes are skipped by
+        count, not by time, since under load Qt delivers them a few ms
+        late. It tries every refresh again once frames look cheap enough,
+        and backs off for longer each time that try fails.
+        """
+
+        MISSES_FOR_HALF = 3      # missed refreshes within a second
+        HALF_HOLD_S = 3.0        # stay at half rate at least this long,
+        HALF_HOLD_MAX_S = 30.0   #  doubled up to this after a failed try
+        RETRY_FAILED_S = 5.0     # back at half rate this soon: a failed try
+        FULL_COST = 0.85         # try full rate below this much of a
+                                 #  refresh (update + paint, 90th percentile)
+
+        def __init__(self, window, widget):
+            super().__init__()
+            self.window = window
+            self.widget = widget
+            self.running = True
+            self.divider = 1           # draw on every Nth refresh
+            self.skipped = 0           # refreshes skipped since the last draw
+            self.last_drawn = None
+            self.half_since = 0.0
+            self.full_since = 0.0
+            self.hold_s = self.HALF_HOLD_S
+            self.misses = collections.deque()  # times of missed refreshes
+            self.costs = collections.deque(maxlen=100)  # seconds per frame
+            self.update_s = None       # update() time of the last frame
+            window.installEventFilter(self)
+            window.requestUpdate()
+
+        def period(self):
+            hz = self.window.screen().refreshRate() if self.window.screen() \
+                else 0
+            return 1 / hz if hz > 0 else 1 / 60
+
+        def fps(self):
+            return 1 / (self.period() * self.divider)
+
+        def eventFilter(self, obj, event):
+            if (self.running
+                    and event.type() == QtCore.QEvent.Type.UpdateRequest):
+                self.frame()
+                self.window.requestUpdate()
+            return False  # let the window paint as usual
+
+        def frame(self):
+            if self.skipped + 1 < self.divider:
+                self.skipped += 1
+                return  # half rate: skip this refresh
+            self.skipped = 0
+            now = time.monotonic()
+            period = self.period()
+            if self.last_drawn is not None:
+                if round((now - self.last_drawn) / period) > self.divider:
+                    self.misses.append(now)
+            self.last_drawn = now
+            if self.update_s is not None:
+                # The last frame's cost: its update() plus the painting
+                #  that followed it. Longer than a refresh means it missed
+                #  one, even when Qt delivered this refresh early enough
+                #  that the gap above still rounds to one
+                cost = self.update_s + self.widget.paint_s
+                self.costs.append(cost)
+                if self.divider == 1 and cost > period:
+                    self.misses.append(now)
+            self.widget.paint_s = 0.0
+            start = time.monotonic()
+            update()
+            self.update_s = time.monotonic() - start
+            self.adapt(now, period)
+
+        def adapt(self, now, period):
+            while self.misses and self.misses[0] < now - 1.0:
+                self.misses.popleft()
+            if self.divider == 1 and len(self.misses) >= self.MISSES_FOR_HALF:
+                if now - self.full_since < self.RETRY_FAILED_S:
+                    self.hold_s = min(2 * self.hold_s, self.HALF_HOLD_MAX_S)
+                else:
+                    self.hold_s = self.HALF_HOLD_S
+                self.divider = 2
+                self.half_since = now
+                self.misses.clear()
+            elif (self.divider == 2
+                  and now - self.half_since >= self.hold_s
+                  and self.costs
+                  and np.percentile(self.costs, 90)
+                  < self.FULL_COST * period):
+                self.divider = 1
+                self.full_since = now
+                self.misses.clear()
+
+        def stop(self):
+            self.running = False
 
     win.show()
+    frames = FrameClock(win.windowHandle(), win)
     app.exec()
     reader.stop()
 
